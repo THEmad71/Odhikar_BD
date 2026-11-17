@@ -16,3 +16,4 @@ llm = ChatGoogleGenerativeAI(
 
 # 2. Bind Odhikar BD tools with Gemini
 llm_with_tools = llm.bind_tools(ODHIKAR_TOOLS)
+#check if the llm_with_tools is working properly
