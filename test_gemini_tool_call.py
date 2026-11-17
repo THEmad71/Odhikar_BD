@@ -7,8 +7,25 @@ from langchain_core.messages import (
 )
 
 from src.odhikar.llm import llm_with_tools
-
 from src.odhikar.langchain_tools import ODHIKAR_TOOLS
+
+
+# Helper: Extract readable text from Gemini response
+def extract_text(content):
+
+    if isinstance(content, str):
+        return content
+
+    answer = ""
+
+    if isinstance(content, list):
+
+        for block in content:
+
+            if isinstance(block, dict) and block.get("type") == "text":
+                answer += block.get("text", "") + "\n"
+
+    return answer.strip()
 
 
 # 1. Create tool registry
@@ -41,6 +58,7 @@ print("Tool Calls:", ai_response.tool_calls)
 # 4. Execute requested tools
 if ai_response.tool_calls:
 
+    # Add Gemini's tool-call message to conversation
     messages.append(ai_response)
 
     for tool_call in ai_response.tool_calls:
@@ -55,14 +73,21 @@ if ai_response.tool_calls:
         if selected_tool is None:
 
             tool_result = {
-                "error": "Requested tool was not found."
+                "error": f"Tool '{tool_name}' was not found."
             }
 
         else:
 
-            tool_result = selected_tool.invoke(
-                tool_call["args"]
-            )
+            try:
+                tool_result = selected_tool.invoke(
+                    tool_call["args"]
+                )
+
+            except Exception as e:
+
+                tool_result = {
+                    "error": str(e)
+                }
 
         print("Tool Result:", tool_result)
 
@@ -71,7 +96,8 @@ if ai_response.tool_calls:
             ToolMessage(
                 content=json.dumps(
                     tool_result,
-                    ensure_ascii=False
+                    ensure_ascii=False,
+                    default=str
                 ),
                 tool_call_id=tool_call["id"]
             )
@@ -83,42 +109,28 @@ if ai_response.tool_calls:
 
     final_response = llm_with_tools.invoke(messages)
 
-
+    # Extract readable answer
+    answer = extract_text(final_response.content)
 
     print("\n--- FINAL RESPONSE DEBUG ---")
 
     print("Full Response:")
     final_response.pretty_print()
 
-    print("\nContent:")
-    # Extract readable text from Gemini response
-
-    answer = ""
-
-    if isinstance(final_response.content, str):
-
-        answer = final_response.content
-
-    elif isinstance(final_response.content, list):
-
-        for block in final_response.content:
-
-            if isinstance(block, dict) and block.get("type") == "text":
-
-                answer += block.get("text", "") + "\n"
-
-
-print("\n--- FINAL ANSWER ---")
-print(answer.strip())
-
     print("\nTool Calls:")
     print(final_response.tool_calls)
 
-
+    print("\n--- FINAL ANSWER ---")
+    print(answer)
 
 
 else:
 
-    print("Gemini did not request any tool.")
+    # Gemini answered without requesting a tool
+    answer = extract_text(ai_response.content)
+
+    print("\n--- DIRECT GEMINI ANSWER ---")
+    print(answer)
+
 
 print("\n--- EXECUTION COMPLETED ---")
