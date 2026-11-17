@@ -1,0 +1,7 @@
+# Odhikar BD - Python dependencies
+
+pydantic
+pydantic-settings
+python-dotenv
+google-genai
+langchain-google-genai
