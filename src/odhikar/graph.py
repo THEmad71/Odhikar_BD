@@ -72,49 +72,39 @@ odhikar_graph = graph_builder.compile()
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
-def ask_odhikar_graph(query: str) -> str:
 
+def ask_odhikar_graph(
+    query: str,
+    thread_id: str
+) -> str:
+
+    # Validate query
     if not isinstance(query, str) or not query.strip():
         return "Please enter a valid question."
 
-    messages = [
-        SystemMessage(
-            content="""
-            You are Odhikar BD, a Bangladesh traffic-law
-            information assistant.
+    # Validate thread ID
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return "A valid thread ID is required."
 
-            Use available tools for traffic-law information.
+    # Configure conversation
+    config = {
+        "configurable": {
+            "thread_id": thread_id
+        },
+        "recursion_limit": 20
+    }
 
-            Do not invent legal information.
+    # Execute LangGraph
+    result = odhikar_graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content=query)
+            ]
+        },
+        config=config
+    )
 
-            If information is unavailable, explain the limitation.
-
-            Do not claim that user documents have been authenticated.
-            """
-        ),
-        HumanMessage(content=query)
-    ]
-
-    result = odhikar_graph.invoke({
-        "messages": messages
-    })
-
+    # Get final response
     final_message = result["messages"][-1]
 
-    content = final_message.content
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-
-        answer = []
-
-        for block in content:
-
-            if isinstance(block, dict) and block.get("type") == "text":
-                answer.append(block.get("text", ""))
-
-        return "\n".join(answer)
-
-    return "Unable to generate an answer."
+    return extract_text(final_message.content)
