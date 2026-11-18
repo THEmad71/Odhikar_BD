@@ -6,33 +6,28 @@ from fastapi import (
     Response,
     Request
 )
-from src.odhikar.session_manager import (
-    login_with_session,
-    logout_session,
-    validate_session
-)
-from src.odhikar.thread_manager import (
-    delete_owned_thread
-)
-from src.odhikar.thread_manager import reset_owned_thread
-from src.odhikar.thread_manager import ask_in_thread
-
-from src.odhikar.user_manager import list_user_threads
-
-from src.odhikar.user_manager import (
-    create_user_thread,
-    list_user_threads
-)
-
+from fastapi.middleware.cors import CORSMiddleware
 
 from pydantic import BaseModel, Field
 
 from src.odhikar.auth_manager import register_user
 
 from src.odhikar.session_manager import (
-    login_with_session
+    login_with_session,
+    logout_session,
+    validate_session
 )
 
+from src.odhikar.thread_manager import (
+    ask_in_thread,
+    delete_owned_thread,
+    reset_owned_thread
+)
+
+from src.odhikar.user_manager import (
+    create_user_thread,
+    list_user_threads
+)
 
 # ==========================================
 # 1. CREATE FASTAPI APPLICATION
@@ -42,6 +37,34 @@ app = FastAPI(
     title="Odhikar BD API",
     description="AI-Powered Bangladesh Traffic Law Assistant",
     version="1.0.0"
+)
+
+# ==========================================
+# CORS CONFIGURATION
+# ==========================================
+
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE",
+        "OPTIONS"
+    ],
+    allow_headers=[
+        "Content-Type",
+        "X-CSRF-Token"
+    ]
 )
 
 
@@ -577,3 +600,71 @@ def reset_conversation(
         "thread_id": thread_id,
         "status": "reset"
     }
+
+# ==========================================
+# 13. CREATE NEW CONVERSATION API
+# ==========================================
+
+@app.post(
+    "/threads",
+    response_model=ThreadResponse,
+    status_code=status.HTTP_201_CREATED
+)
+def create_thread(request: Request):
+
+    # STEP 1: Get session token
+    session_token = request.cookies.get(
+        "odhikar_session"
+    )
+
+    if not session_token:
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please login first."
+        )
+
+    # STEP 2: Validate session
+    user = validate_session(session_token)
+
+    if user is None:
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session."
+        )
+
+    # STEP 3: Create thread for authenticated user
+    thread_id = create_user_thread(
+        user["user_id"]
+    )
+
+    if not thread_id:
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create conversation."
+        )
+
+    # STEP 4: Retrieve created thread
+    threads = list_user_threads(
+        user["user_id"]
+    )
+
+    created_thread = next(
+        (
+            thread for thread in threads
+            if thread["thread_id"] == thread_id
+        ),
+        None
+    )
+
+    if created_thread is None:
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Created conversation could not be verified."
+        )
+
+    # STEP 5: Return conversation
+    return created_thread
