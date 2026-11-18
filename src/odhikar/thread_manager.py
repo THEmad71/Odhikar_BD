@@ -14,7 +14,10 @@ from src.odhikar.graph import (
     checkpointer
 )
 
-
+from src.odhikar.user_manager import (
+    list_user_threads,
+    delete_user_thread_record
+)
 # ==========================================
 # 1. CREATE NEW THREAD
 # ==========================================
@@ -95,6 +98,12 @@ def delete_thread(thread_id: str) -> bool:
     return thread_id not in list_threads()
 
 
+
+
+
+
+
+
 # ==========================================
 # 6. RESET A CONVERSATION
 # ==========================================
@@ -110,15 +119,65 @@ def reset_thread(thread_id: str) -> bool:
     if not thread_id:
         return False
 
-    # Check whether thread exists
-    if thread_id not in list_threads():
+    try:
+
+        # Delete all checkpoints for this thread
+        checkpointer.delete_thread(thread_id)
+
+        # Verify that old conversation history is cleared
+        return thread_id not in list_threads()
+
+    except Exception as error:
+
+        print(f"Thread reset error: {error}")
         return False
 
-    # Clear existing conversation checkpoints
-    checkpointer.delete_thread(thread_id)
 
-    # Verify that old history is cleared
-    return thread_id not in list_threads()
+# ==========================================
+# 11. RESET USER-OWNED CONVERSATION
+# ==========================================
+
+def reset_owned_thread(
+    user_id: str,
+    thread_id: str
+) -> bool:
+
+    # Validate input
+    if not isinstance(user_id, str) or not user_id.strip():
+        return False
+
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return False
+
+    user_id = user_id.strip()
+    thread_id = thread_id.strip()
+
+    # STEP 1: Check conversation ownership
+    user_threads = list_user_threads(user_id)
+
+    owns_thread = any(
+        thread["thread_id"] == thread_id
+        for thread in user_threads
+    )
+
+    if not owns_thread:
+        return False
+
+    # STEP 2: Clear conversation checkpoints
+    reset_success = reset_thread(thread_id)
+
+    if not reset_success:
+        return False
+
+    # STEP 3: Verify user-thread mapping still exists
+    remaining_threads = list_user_threads(user_id)
+
+    mapping_exists = any(
+        thread["thread_id"] == thread_id
+        for thread in remaining_threads
+    )
+
+    return mapping_exists
 
 
 # ==========================================
@@ -203,5 +262,43 @@ def ask_in_authenticated_thread(
     # STEP 4: Execute AI agent
     return ask_in_thread(
         query,
+        thread_id
+    )
+
+# ==========================================
+# 10. DELETE OWNED CONVERSATION
+# ==========================================
+
+def delete_owned_thread(
+    user_id: str,
+    thread_id: str
+) -> bool:
+
+    if not isinstance(user_id, str) or not user_id.strip():
+        return False
+
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return False
+
+    # Verify ownership
+    user_threads = list_user_threads(user_id)
+
+    owns_thread = any(
+        thread["thread_id"] == thread_id
+        for thread in user_threads
+    )
+
+    if not owns_thread:
+        return False
+
+    # Delete LangGraph checkpoint
+    checkpoint_deleted = delete_thread(thread_id)
+
+    if not checkpoint_deleted:
+        return False
+
+    # Delete user-thread mapping
+    return delete_user_thread_record(
+        user_id,
         thread_id
     )

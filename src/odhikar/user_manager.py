@@ -228,3 +228,34 @@ def list_user_threads(user_id: str) -> list:
         dict(record)
         for record in records
     ]
+
+
+# ==========================================
+# 8. DELETE USER THREAD RECORD
+# ==========================================
+
+def delete_user_thread_record(
+    user_id: str,
+    thread_id: str
+) -> bool:
+
+    if not isinstance(user_id, str):
+        return False
+
+    if not isinstance(thread_id, str):
+        return False
+
+    with closing(get_connection()) as conn:
+
+        with conn:
+
+            cursor = conn.execute("""
+                DELETE FROM user_threads
+                WHERE user_id = ?
+                AND thread_id = ?
+            """, (
+                user_id.strip(),
+                thread_id.strip()
+            ))
+
+            return cursor.rowcount > 0
