@@ -1,4 +1,4 @@
-
+from src.odhikar.user_manager import list_user_threads
 from uuid import uuid4
 
 
@@ -113,3 +113,32 @@ def reset_thread(thread_id: str) -> bool:
 
     # Verify that old history is cleared
     return thread_id not in list_threads()
+
+
+# ==========================================
+# 7. USER-OWNED CONVERSATION ACCESS
+# ==========================================
+
+def ask_in_user_thread(
+    user_id: str,
+    thread_id: str,
+    query: str
+) -> str:
+
+    if not user_id or not thread_id:
+        return "User ID and Thread ID are required."
+
+    # Retrieve conversations owned by this user
+    user_threads = list_user_threads(user_id)
+
+    # Verify ownership
+    owns_thread = any(
+        thread["thread_id"] == thread_id
+        for thread in user_threads
+    )
+
+    if not owns_thread:
+        return "Access denied: This conversation does not belong to this user."
+
+    # Execute question only after ownership verification
+    return ask_in_thread(query, thread_id)
