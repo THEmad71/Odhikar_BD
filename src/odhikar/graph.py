@@ -1,21 +1,21 @@
 
 import sqlite3
+import json
+import logging
+
 from pathlib import Path
 
 from langchain_core.messages import (
     HumanMessage,
-    SystemMessage
+    SystemMessage,
+    ToolMessage
 )
 
 from langgraph.graph import (
     StateGraph,
     START,
+    END,
     MessagesState
-)
-
-from langgraph.prebuilt import (
-    ToolNode,
-    tools_condition
 )
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -23,6 +23,13 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from src.odhikar.database import DB_PATH
 from src.odhikar.llm import llm_with_tools
 from src.odhikar.langchain_tools import ODHIKAR_TOOLS
+
+
+# ==========================================
+# 0. LOGGING
+# ==========================================
+
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
@@ -40,13 +47,13 @@ SYSTEM_PROMPT = SystemMessage(
 
     IMPORTANT CONVERSATION MEMORY RULES:
 
-    1. Always consider the previous conversation messages.
+    1. Always consider previous conversation messages.
     2. Understand follow-up questions using previous context.
     3. If the user asks about imprisonment, fine, or punishment
        without naming an offence, identify the offence from
        the previous conversation.
     4. Do not ask the user to repeat information already
-       available in the conversation history.
+       available in conversation history.
     5. Use available tools when additional legal information
        needs to be retrieved.
 
@@ -62,7 +69,17 @@ SYSTEM_PROMPT = SystemMessage(
 
 
 # ==========================================
-# 2. CHATBOT NODE
+# 2. TOOL REGISTRY
+# ==========================================
+
+TOOL_MAP = {
+    tool.name: tool
+    for tool in ODHIKAR_TOOLS
+}
+
+
+# ==========================================
+# 3. CHATBOT NODE
 # ==========================================
 
 def chatbot(state: MessagesState):
@@ -80,14 +97,170 @@ def chatbot(state: MessagesState):
 
 
 # ==========================================
-# 3. CREATE GRAPH BUILDER
+# 4. CUSTOM TOOL EXECUTION NODE
+# ==========================================
+
+def execute_tools(state: MessagesState):
+
+    messages = state["messages"]
+
+    if not messages:
+        return {"messages": []}
+
+    last_message = messages[-1]
+
+    tool_calls = getattr(
+        last_message,
+        "tool_calls",
+        []
+    )
+
+    if not tool_calls:
+        return {"messages": []}
+
+    tool_messages = []
+
+    # Execute every requested tool
+
+    for call in tool_calls:
+
+        tool_name = call.get("name")
+
+        tool_call_id = call.get("id")
+
+        tool_args = call.get("args", {})
+
+        # Validate tool call ID
+
+        if not tool_call_id:
+
+            logger.error(
+                "Tool call ID missing for %s",
+                tool_name
+            )
+
+            continue
+
+        # Find requested tool
+
+        tool = TOOL_MAP.get(tool_name)
+
+        if tool is None:
+
+            result_content = json.dumps(
+                {
+                    "status": "error",
+                    "message": "Requested tool is unavailable."
+                },
+                ensure_ascii=False
+            )
+
+        else:
+
+            try:
+
+                # Execute Python tool directly
+
+                if not isinstance(tool_args, dict):
+                    raise ValueError(
+                        "Tool arguments must be a dictionary."
+                    )
+
+                result = tool.invoke(tool_args)
+
+                # Convert result to readable JSON
+
+                if isinstance(result, str):
+
+                    result_content = result
+
+                else:
+
+                    result_content = json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        default=str
+                    )
+
+                logger.info(
+                    "Tool executed successfully: %s",
+                    tool_name
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Tool execution failed: %s",
+                    tool_name
+                )
+
+                result_content = json.dumps(
+                    {
+                        "status": "error",
+                        "message": (
+                            "Tool execution failed. "
+                            "Do not invent an answer. "
+                            "Explain that the information "
+                            "could not be retrieved."
+                        )
+                    },
+                    ensure_ascii=False
+                )
+
+        # Create ToolMessage
+
+        tool_message = ToolMessage(
+            content=result_content,
+            tool_call_id=tool_call_id,
+            name=tool_name or "unknown_tool"
+        )
+
+        tool_messages.append(tool_message)
+
+    return {
+        "messages": tool_messages
+    }
+
+
+# ==========================================
+# 5. CUSTOM CONDITIONAL ROUTER
+# ==========================================
+
+def route_after_chatbot(state: MessagesState):
+
+    messages = state["messages"]
+
+    if not messages:
+        return END
+
+    last_message = messages[-1]
+
+    tool_calls = getattr(
+        last_message,
+        "tool_calls",
+        []
+    )
+
+    # If Gemini requests a tool,
+    # route execution to custom tool node.
+
+    if tool_calls:
+        return "tools"
+
+    # Otherwise finish the graph.
+
+    return END
+
+
+# ==========================================
+# 6. CREATE GRAPH BUILDER
 # ==========================================
 
 graph_builder = StateGraph(MessagesState)
 
 
 # ==========================================
-# 4. REGISTER NODES
+# 7. REGISTER NODES
 # ==========================================
 
 graph_builder.add_node(
@@ -97,31 +270,23 @@ graph_builder.add_node(
 
 graph_builder.add_node(
     "tools",
-    ToolNode(ODHIKAR_TOOLS)
+    execute_tools
 )
 
 
 # ==========================================
-# 5. DEFINE GRAPH EDGES
+# 8. DEFINE GRAPH EDGES
 # ==========================================
-
-# START -> CHATBOT
 
 graph_builder.add_edge(
     START,
     "chatbot"
 )
 
-
-# CHATBOT -> TOOLS OR END
-
 graph_builder.add_conditional_edges(
     "chatbot",
-    tools_condition
+    route_after_chatbot
 )
-
-
-# TOOLS -> CHATBOT
 
 graph_builder.add_edge(
     "tools",
@@ -130,7 +295,7 @@ graph_builder.add_edge(
 
 
 # ==========================================
-# 6. CHECKPOINT DATABASE PATH
+# 9. CHECKPOINT DATABASE PATH
 # ==========================================
 
 CHECKPOINT_DB_PATH = (
@@ -146,7 +311,7 @@ CHECKPOINT_DB_PATH.parent.mkdir(
 
 
 # ==========================================
-# 7. SQLITE CONNECTION
+# 10. SQLITE CONNECTION
 # ==========================================
 
 checkpoint_connection = sqlite3.connect(
@@ -157,7 +322,7 @@ checkpoint_connection = sqlite3.connect(
 
 
 # ==========================================
-# 8. INITIALIZE CHECKPOINTER
+# 11. INITIALIZE CHECKPOINTER
 # ==========================================
 
 checkpointer = SqliteSaver(
@@ -168,7 +333,7 @@ checkpointer.setup()
 
 
 # ==========================================
-# 9. COMPILE GRAPH WITH MEMORY
+# 12. COMPILE GRAPH WITH MEMORY
 # ==========================================
 
 odhikar_graph = graph_builder.compile(
@@ -177,7 +342,7 @@ odhikar_graph = graph_builder.compile(
 
 
 # ==========================================
-# 10. EXTRACT READABLE TEXT
+# 13. EXTRACT READABLE TEXT
 # ==========================================
 
 def extract_text(content):
@@ -209,7 +374,7 @@ def extract_text(content):
 
 
 # ==========================================
-# 11. MAIN ODHIKAR GRAPH FUNCTION
+# 14. MAIN ODHIKAR GRAPH FUNCTION
 # ==========================================
 
 def ask_odhikar_graph(
@@ -217,17 +382,14 @@ def ask_odhikar_graph(
     thread_id: str
 ) -> str:
 
-    # Validate query
     if not isinstance(query, str) or not query.strip():
 
         return "Please enter a valid question."
 
-    # Validate thread ID
     if not isinstance(thread_id, str) or not thread_id.strip():
 
         return "A valid thread ID is required."
 
-    # Configure conversation thread
     config = {
         "configurable": {
             "thread_id": thread_id.strip()
@@ -235,27 +397,26 @@ def ask_odhikar_graph(
         "recursion_limit": 20
     }
 
-    # Execute LangGraph
     result = odhikar_graph.invoke(
         {
             "messages": [
-                HumanMessage(content=query.strip())
+                HumanMessage(
+                    content=query.strip()
+                )
             ]
         },
         config=config
     )
 
-    # Get final message
     final_message = result["messages"][-1]
 
-    # Extract readable answer
     return extract_text(
         final_message.content
     )
 
 
 # ==========================================
-# 12. GRAPH INFORMATION
+# 15. GRAPH INFORMATION
 # ==========================================
 
 def get_graph_info():
@@ -268,6 +429,10 @@ def get_graph_info():
             "tools"
         ],
 
+        "tool_count": len(ODHIKAR_TOOLS),
+
+        "tool_execution": "custom",
+
         "checkpoint_database": str(
             CHECKPOINT_DB_PATH
         ),
@@ -277,7 +442,7 @@ def get_graph_info():
 
 
 # ==========================================
-# 13. GET CONVERSATION HISTORY
+# 16. GET CONVERSATION HISTORY
 # ==========================================
 
 def get_conversation_history(thread_id: str):
@@ -293,4 +458,10 @@ def get_conversation_history(thread_id: str):
 
     snapshot = odhikar_graph.get_state(config)
 
-    return snapshot.values.get("messages", [])
+    if not snapshot or not snapshot.values:
+        return []
+
+    return snapshot.values.get(
+        "messages",
+        []
+    )
