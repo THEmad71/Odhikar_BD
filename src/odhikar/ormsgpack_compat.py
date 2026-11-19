@@ -3,8 +3,8 @@
 Experimental Pure Python compatibility layer
 for the ormsgpack API used by LangGraph.
 
-Uses msgpack.fallback instead of the native
-ormsgpack DLL blocked by Windows security.
+Backend: msgpack.fallback
+Purpose: Avoid blocked native ormsgpack DLL.
 """
 
 import sys
@@ -37,15 +37,27 @@ Ext = fallback.ExtType
 # ==========================================
 
 class MsgpackEncodeError(TypeError):
-    """Compatible encoding exception."""
+    """Compatible serialization exception."""
     pass
 
 
 # ==========================================
-# 4. ENUM PREPROCESSING
+# 4. PREPARE PYTHON OBJECTS
 # ==========================================
 
 def _prepare_enums(obj, default=None):
+
+    # IMPORTANT:
+    # ExtType and Timestamp must be preserved.
+    # ExtType is a tuple subclass.
+
+    if isinstance(
+        obj,
+        (fallback.ExtType, fallback.Timestamp)
+    ):
+        return obj
+
+    # Handle Enum before primitive/container types.
 
     if isinstance(obj, Enum):
 
@@ -53,6 +65,8 @@ def _prepare_enums(obj, default=None):
             return default(obj)
 
         return obj.value
+
+    # Dictionary
 
     if isinstance(obj, dict):
 
@@ -62,12 +76,16 @@ def _prepare_enums(obj, default=None):
             for key, value in obj.items()
         }
 
+    # List
+
     if isinstance(obj, list):
 
         return [
             _prepare_enums(item, default)
             for item in obj
         ]
+
+    # Tuple
 
     if isinstance(obj, tuple):
 
@@ -137,11 +155,14 @@ def unpackb(
         not bool(option & OPT_NON_STR_KEYS)
     )
 
-    # FIX:
-    # Pure Python msgpack requires ext_hook
-    # to be callable when explicitly provided.
+    # Pass ext_hook only when callable.
 
     if ext_hook is not None:
+
+        if not callable(ext_hook):
+            raise TypeError(
+                "ext_hook must be callable or None"
+            )
 
         kwargs["ext_hook"] = ext_hook
 
@@ -180,9 +201,9 @@ def get_info():
 
     return {
         "implementation": "msgpack.fallback",
-        "native_extension": False,
         "pure_python": True,
-        "ext_type_supported": True,
-        "non_string_keys_supported": True,
-        "ext_hook_none_supported": True
+        "native_extension": False,
+        "extension_type": True,
+        "non_string_keys": True,
+        "ext_hook": True
     }

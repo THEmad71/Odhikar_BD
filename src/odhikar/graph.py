@@ -1,3 +1,8 @@
+from src.odhikar.ormsgpack_compat import (
+    install as install_ormsgpack_compat
+)
+
+install_ormsgpack_compat()
 
 import sqlite3
 import json
