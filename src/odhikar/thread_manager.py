@@ -1,12 +1,36 @@
-from src.odhikar.user_manager import list_user_threads
-from uuid import uuid4
+
+"""
+Odhikar BD - Secure Thread Manager
+
+Features:
+1. Authenticated conversation creation
+2. Authenticated conversation access
+3. Thread ownership verification
+4. Conversation history retrieval
+5. User-specific thread listing
+6. Secure conversation deletion
+7. Secure conversation reset
+8. SQLite checkpoint management
+
+IMPORTANT:
+All public user-facing operations require
+a valid authenticated session token.
+"""
+
+
+# ==========================================
+# 1. IMPORTS
+# ==========================================
 
 from src.odhikar.user_manager import (
+    create_user_thread,
     list_user_threads,
-    create_user_thread
+    delete_user_thread_record
 )
 
-from src.odhikar.session_manager import validate_session
+from src.odhikar.session_manager import (
+    validate_session
+)
 
 from src.odhikar.graph import (
     ask_odhikar_graph,
@@ -14,52 +38,64 @@ from src.odhikar.graph import (
     checkpointer
 )
 
-from src.odhikar.user_manager import (
-    list_user_threads,
-    delete_user_thread_record
-)
-# ==========================================
-# 1. CREATE NEW THREAD
-# ==========================================
-
-def create_thread_id():
-
-    return f"odhikar_{uuid4().hex[:12]}"
-
 
 # ==========================================
-# 2. ASK QUESTION IN A THREAD
+# 2. INPUT VALIDATION
 # ==========================================
 
-def ask_in_thread(query: str, thread_id: str):
+def _valid_thread_id(thread_id: str) -> bool:
 
-    return ask_odhikar_graph(
-        query,
-        thread_id=thread_id
+    return (
+        isinstance(thread_id, str)
+        and bool(thread_id.strip())
+        and len(thread_id) <= 256
+    )
+
+
+def _valid_query(query: str) -> bool:
+
+    return (
+        isinstance(query, str)
+        and bool(query.strip())
     )
 
 
 # ==========================================
-# 3. GET THREAD HISTORY
+# 3. VERIFY THREAD OWNERSHIP
 # ==========================================
 
-def get_thread_history(thread_id: str):
+def _owns_thread(
+    user_id: str,
+    thread_id: str
+) -> bool:
 
-    return get_conversation_history(thread_id)
+    if not isinstance(user_id, str) or not user_id.strip():
+        return False
+
+    if not _valid_thread_id(thread_id):
+        return False
+
+    user_threads = list_user_threads(
+        user_id.strip()
+    )
+
+    return any(
+        thread.get("thread_id") == thread_id.strip()
+        for thread in user_threads
+    )
 
 
 # ==========================================
-# 4. LIST ALL SAVED THREADS
+# 4. GET CHECKPOINT THREAD IDS
 # ==========================================
 
-def list_threads():
+def _get_checkpoint_thread_ids() -> set:
 
-    threads = set()
+    thread_ids = set()
 
-    # Retrieve saved checkpoints
     for checkpoint in checkpointer.list(None):
 
-        config = checkpoint.config
+        config = checkpoint.config or {}
 
         configurable = config.get(
             "configurable", {}
@@ -68,165 +104,77 @@ def list_threads():
         thread_id = configurable.get("thread_id")
 
         if thread_id:
-            threads.add(thread_id)
+            thread_ids.add(thread_id)
 
-    return sorted(threads)
-
-# ==========================================
-# 5. DELETE A CONVERSATION
-# ==========================================
-
-def delete_thread(thread_id: str) -> bool:
-
-    # Validate input
-    if not isinstance(thread_id, str):
-        return False
-
-    thread_id = thread_id.strip()
-
-    if not thread_id:
-        return False
-
-    # Check whether conversation exists
-    if thread_id not in list_threads():
-        return False
-
-    # Delete conversation from SQLite
-    checkpointer.delete_thread(thread_id)
-
-    # Verify deletion
-    return thread_id not in list_threads()
-
-
-
-
-
-
+    return thread_ids
 
 
 # ==========================================
-# 6. RESET A CONVERSATION
+# 5. DELETE THREAD CHECKPOINT
 # ==========================================
 
-def reset_thread(thread_id: str) -> bool:
-
-    # Validate input
-    if not isinstance(thread_id, str):
-        return False
-
-    thread_id = thread_id.strip()
-
-    if not thread_id:
-        return False
-
-    try:
-
-        # Delete all checkpoints for this thread
-        checkpointer.delete_thread(thread_id)
-
-        # Verify that old conversation history is cleared
-        return thread_id not in list_threads()
-
-    except Exception as error:
-
-        print(f"Thread reset error: {error}")
-        return False
-
-
-# ==========================================
-# 11. RESET USER-OWNED CONVERSATION
-# ==========================================
-
-def reset_owned_thread(
-    user_id: str,
+def _delete_thread_checkpoint(
     thread_id: str
 ) -> bool:
 
-    # Validate input
-    if not isinstance(user_id, str) or not user_id.strip():
+    if not _valid_thread_id(thread_id):
         return False
 
-    if not isinstance(thread_id, str) or not thread_id.strip():
-        return False
-
-    user_id = user_id.strip()
     thread_id = thread_id.strip()
 
-    # STEP 1: Check conversation ownership
-    user_threads = list_user_threads(user_id)
+    try:
 
-    owns_thread = any(
-        thread["thread_id"] == thread_id
-        for thread in user_threads
-    )
+        # Delete all LangGraph checkpoints
+        checkpointer.delete_thread(thread_id)
 
-    if not owns_thread:
+        # Verify deletion
+        return (
+            thread_id not in _get_checkpoint_thread_ids()
+        )
+
+    except Exception as error:
+
+        print(
+            f"Checkpoint deletion error: {error}"
+        )
+
         return False
 
-    # STEP 2: Clear conversation checkpoints
-    reset_success = reset_thread(thread_id)
-
-    if not reset_success:
-        return False
-
-    # STEP 3: Verify user-thread mapping still exists
-    remaining_threads = list_user_threads(user_id)
-
-    mapping_exists = any(
-        thread["thread_id"] == thread_id
-        for thread in remaining_threads
-    )
-
-    return mapping_exists
-
 
 # ==========================================
-# 7. USER-OWNED CONVERSATION ACCESS
+# 6. CREATE AUTHENTICATED THREAD
 # ==========================================
 
-def ask_in_user_thread(
-    user_id: str,
-    thread_id: str,
-    query: str
-) -> str:
+def create_authenticated_thread(
+    session_token: str
+):
 
-    if not user_id or not thread_id:
-        return "User ID and Thread ID are required."
-
-    # Retrieve conversations owned by this user
-    user_threads = list_user_threads(user_id)
-
-    # Verify ownership
-    owns_thread = any(
-        thread["thread_id"] == thread_id
-        for thread in user_threads
-    )
-
-    if not owns_thread:
-        return "Access denied: This conversation does not belong to this user."
-
-    # Execute question only after ownership verification
-    return ask_in_thread(query, thread_id)
-
-
-# ==========================================
-# 8. CREATE AUTHENTICATED CONVERSATION
-# ==========================================
-
-def create_authenticated_thread(session_token: str):
-
-    # Verify login session
+    # Validate session
     user = validate_session(session_token)
 
     if user is None:
         return None
 
     # Create conversation for authenticated user
-    return create_user_thread(user["user_id"])
+    try:
+
+        thread_id = create_user_thread(
+            user["user_id"]
+        )
+
+        return thread_id
+
+    except Exception as error:
+
+        print(
+            f"Thread creation error: {error}"
+        )
+
+        return None
 
 
 # ==========================================
-# 9. ASK QUESTION WITH AUTHENTICATION
+# 7. ASK QUESTION IN AUTHENTICATED THREAD
 # ==========================================
 
 def ask_in_authenticated_thread(
@@ -239,66 +187,219 @@ def ask_in_authenticated_thread(
     user = validate_session(session_token)
 
     if user is None:
-        return "Authentication required. Please login first."
 
-    # STEP 2: Validate input
-    if not isinstance(thread_id, str) or not thread_id.strip():
+        return (
+            "Authentication required. "
+            "Please login first."
+        )
+
+    # STEP 2: Validate thread ID
+    if not _valid_thread_id(thread_id):
+
         return "A valid Thread ID is required."
 
-    if not isinstance(query, str) or not query.strip():
+    # STEP 3: Validate query
+    if not _valid_query(query):
+
         return "Please enter a valid question."
 
-    # STEP 3: Check conversation ownership
-    user_threads = list_user_threads(user["user_id"])
+    thread_id = thread_id.strip()
 
-    owns_thread = any(
-        thread["thread_id"] == thread_id
-        for thread in user_threads
-    )
-
-    if not owns_thread:
-        return "Access denied: This conversation does not belong to this user."
-
-    # STEP 4: Execute AI agent
-    return ask_in_thread(
-        query,
+    # STEP 4: Verify ownership
+    if not _owns_thread(
+        user["user_id"],
         thread_id
+    ):
+
+        return (
+            "Access denied: This conversation "
+            "does not belong to this user."
+        )
+
+    # STEP 5: Execute AI agent
+    return ask_odhikar_graph(
+        query.strip(),
+        thread_id=thread_id
     )
 
+
 # ==========================================
-# 10. DELETE OWNED CONVERSATION
+# 8. GET AUTHENTICATED THREAD HISTORY
 # ==========================================
 
-def delete_owned_thread(
-    user_id: str,
+def get_authenticated_thread_history(
+    session_token: str,
+    thread_id: str
+) -> list:
+
+    # Validate session
+    user = validate_session(session_token)
+
+    if user is None:
+        return []
+
+    if not _valid_thread_id(thread_id):
+        return []
+
+    thread_id = thread_id.strip()
+
+    # Verify ownership
+    if not _owns_thread(
+        user["user_id"],
+        thread_id
+    ):
+        return []
+
+    # Retrieve conversation history
+    try:
+
+        return get_conversation_history(
+            thread_id
+        )
+
+    except Exception as error:
+
+        print(
+            f"History retrieval error: {error}"
+        )
+
+        return []
+
+
+# ==========================================
+# 9. LIST AUTHENTICATED USER THREADS
+# ==========================================
+
+def list_authenticated_threads(
+    session_token: str
+) -> list:
+
+    # Validate session
+    user = validate_session(session_token)
+
+    if user is None:
+        return []
+
+    # Return only authenticated user's threads
+    return list_user_threads(
+        user["user_id"]
+    )
+
+
+# ==========================================
+# 10. RESET AUTHENTICATED THREAD
+# ==========================================
+
+def reset_authenticated_thread(
+    session_token: str,
     thread_id: str
 ) -> bool:
 
-    if not isinstance(user_id, str) or not user_id.strip():
+    # STEP 1: Validate session
+    user = validate_session(session_token)
+
+    if user is None:
         return False
 
-    if not isinstance(thread_id, str) or not thread_id.strip():
+    if not _valid_thread_id(thread_id):
         return False
 
-    # Verify ownership
-    user_threads = list_user_threads(user_id)
+    thread_id = thread_id.strip()
 
-    owns_thread = any(
-        thread["thread_id"] == thread_id
-        for thread in user_threads
+    # STEP 2: Verify ownership
+    if not _owns_thread(
+        user["user_id"],
+        thread_id
+    ):
+        return False
+
+    # STEP 3: Delete conversation checkpoints
+    reset_success = _delete_thread_checkpoint(
+        thread_id
     )
 
-    if not owns_thread:
+    if not reset_success:
         return False
 
-    # Delete LangGraph checkpoint
-    checkpoint_deleted = delete_thread(thread_id)
+    # STEP 4: Verify ownership mapping remains
+    return _owns_thread(
+        user["user_id"],
+        thread_id
+    )
+
+
+# ==========================================
+# 11. DELETE AUTHENTICATED THREAD
+# ==========================================
+
+def delete_authenticated_thread(
+    session_token: str,
+    thread_id: str
+) -> bool:
+
+    # STEP 1: Validate session
+    user = validate_session(session_token)
+
+    if user is None:
+        return False
+
+    if not _valid_thread_id(thread_id):
+        return False
+
+    thread_id = thread_id.strip()
+
+    # STEP 2: Verify ownership
+    if not _owns_thread(
+        user["user_id"],
+        thread_id
+    ):
+        return False
+
+    # STEP 3: Delete LangGraph checkpoints
+    checkpoint_deleted = _delete_thread_checkpoint(
+        thread_id
+    )
 
     if not checkpoint_deleted:
         return False
 
-    # Delete user-thread mapping
-    return delete_user_thread_record(
-        user_id,
+    # STEP 4: Delete user-thread mapping
+    mapping_deleted = delete_user_thread_record(
+        user["user_id"],
         thread_id
     )
+
+    if not mapping_deleted:
+        return False
+
+    # STEP 5: Verify complete deletion
+    return (
+        not _owns_thread(user["user_id"], thread_id)
+        and thread_id not in _get_checkpoint_thread_ids()
+    )
+
+
+# ==========================================
+# 12. THREAD MANAGER INFORMATION
+# ==========================================
+
+def get_thread_manager_info():
+
+    return {
+        "module": "Odhikar BD Thread Manager",
+
+        "authentication_required": True,
+
+        "ownership_verification": True,
+
+        "features": [
+            "authenticated_thread_creation",
+            "authenticated_question_answering",
+            "authenticated_history",
+            "authenticated_thread_listing",
+            "authenticated_thread_reset",
+            "authenticated_thread_deletion"
+        ],
+
+        "storage": "SQLite + LangGraph Checkpointer"
+    }
