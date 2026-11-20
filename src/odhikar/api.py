@@ -1,14 +1,48 @@
 
+"""
+Odhikar BD - Secure FastAPI Application
+
+Features:
+1. User registration and authentication
+2. Secure session cookies
+3. Session validation
+4. CSRF protection
+5. Login rate limiting
+6. Authenticated conversation creation
+7. User-specific conversation listing
+8. Conversation history retrieval
+9. Authenticated AI chat
+10. Secure conversation reset and deletion
+11. CORS configuration for explicitly trusted origins
+"""
+
+import os
+import time
+import hmac
+import hashlib
+import secrets
+import logging
+
+from collections import defaultdict, deque
+from threading import Lock
+from urllib.parse import urlsplit
+from typing import Literal
+
 from fastapi import (
     FastAPI,
     HTTPException,
     status,
     Response,
-    Request
+    Request,
+    Depends,
+    Path
 )
+
 from fastapi.middleware.cors import CORSMiddleware
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+
+from src.odhikar.config import settings
 
 from src.odhikar.auth_manager import register_user
 
@@ -19,60 +53,306 @@ from src.odhikar.session_manager import (
 )
 
 from src.odhikar.thread_manager import (
-    ask_in_thread,
-    delete_owned_thread,
-    reset_owned_thread
+    create_authenticated_thread,
+    ask_in_authenticated_thread,
+    get_authenticated_thread_history,
+    list_authenticated_threads,
+    reset_authenticated_thread,
+    delete_authenticated_thread
 )
 
-from src.odhikar.user_manager import (
-    create_user_thread,
-    list_user_threads
+
+# ==========================================
+# 1. APPLICATION CONFIGURATION
+# ==========================================
+
+logger = logging.getLogger("odhikar.api")
+
+APP_NAME = "Odhikar BD"
+
+SESSION_COOKIE = "odhikar_session"
+
+CSRF_COOKIE = "odhikar_csrf"
+
+SESSION_MAX_AGE = 24 * 60 * 60
+
+COOKIE_SECURE = (
+    settings.app_env.lower() in {"production", "prod"}
 )
 
-# ==========================================
-# 1. CREATE FASTAPI APPLICATION
-# ==========================================
+COOKIE_SAMESITE = "lax"
 
-app = FastAPI(
-    title="Odhikar BD API",
-    description="AI-Powered Bangladesh Traffic Law Assistant",
-    version="1.0.0"
-)
 
-# ==========================================
-# CORS CONFIGURATION
-# ==========================================
+# Configure explicitly trusted frontend origins.
+# Example:
+# ODHIKAR_ALLOWED_ORIGINS=http://localhost:3000,https://example.com
 
 ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173"
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "ODHIKAR_ALLOWED_ORIGINS",
+        ""
+    ).split(",")
+    if origin.strip()
 ]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "DELETE",
-        "OPTIONS"
-    ],
-    allow_headers=[
-        "Content-Type",
-        "X-CSRF-Token"
-    ]
-)
 
 
 # ==========================================
-# 2. REGISTRATION REQUEST MODEL
+# 2. LOGIN RATE LIMIT CONFIGURATION
+# ==========================================
+
+MAX_LOGIN_FAILURES = 5
+
+LOGIN_WINDOW_SECONDS = 15 * 60
+
+login_failures = defaultdict(deque)
+
+login_lock = Lock()
+
+
+def get_client_ip(request: Request) -> str:
+
+    if request.client is None:
+        return "unknown"
+
+    # Do not trust arbitrary X-Forwarded-For headers.
+    return request.client.host
+
+
+def check_login_rate_limit(client_ip: str):
+
+    now = time.monotonic()
+
+    with login_lock:
+
+        attempts = login_failures[client_ip]
+
+        while (
+            attempts
+            and now - attempts[0] >= LOGIN_WINDOW_SECONDS
+        ):
+            attempts.popleft()
+
+        if len(attempts) >= MAX_LOGIN_FAILURES:
+
+            retry_after = max(
+                1,
+                int(
+                    LOGIN_WINDOW_SECONDS
+                    - (now - attempts[0])
+                )
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts. Please try again later.",
+                headers={
+                    "Retry-After": str(retry_after)
+                }
+            )
+
+
+def record_failed_login(client_ip: str):
+
+    with login_lock:
+
+        login_failures[client_ip].append(
+            time.monotonic()
+        )
+
+
+def clear_login_failures(client_ip: str):
+
+    with login_lock:
+
+        login_failures.pop(
+            client_ip,
+            None
+        )
+
+
+# ==========================================
+# 3. CSRF TOKEN GENERATION
+# ==========================================
+
+def generate_csrf_token(
+    session_token: str
+) -> str:
+
+    nonce = secrets.token_urlsafe(32)
+
+    signature = hmac.new(
+        session_token.encode("utf-8"),
+        nonce.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    return f"{nonce}.{signature}"
+
+
+# ==========================================
+# 4. CSRF TOKEN VALIDATION
+# ==========================================
+
+def validate_csrf_token(
+    session_token: str,
+    csrf_token: str
+) -> bool:
+
+    if (
+        not isinstance(session_token, str)
+        or not isinstance(csrf_token, str)
+        or len(csrf_token) > 512
+    ):
+        return False
+
+    try:
+
+        nonce, supplied_signature = csrf_token.split(".", 1)
+
+        if not nonce or not supplied_signature:
+            return False
+
+        expected_signature = hmac.new(
+            session_token.encode("utf-8"),
+            nonce.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        return hmac.compare_digest(
+            supplied_signature,
+            expected_signature
+        )
+
+    except (ValueError, TypeError):
+
+        return False
+
+
+# ==========================================
+# 5. ORIGIN VALIDATION
+# ==========================================
+
+def validate_request_origin(request: Request):
+
+    origin = request.headers.get("origin")
+
+    # Non-browser clients may not send Origin.
+    if not origin:
+        return
+
+    origin = origin.rstrip("/")
+
+    request_origin = (
+        f"{request.url.scheme}://{request.url.netloc}"
+    ).rstrip("/")
+
+    allowed = (
+        origin == request_origin
+        or origin in ALLOWED_ORIGINS
+    )
+
+    if not allowed:
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Request origin is not allowed."
+        )
+
+
+# ==========================================
+# 6. AUTHENTICATION DEPENDENCY
+# ==========================================
+
+def get_authenticated_context(
+    request: Request
+) -> dict:
+
+    session_token = request.cookies.get(
+        SESSION_COOKIE
+    )
+
+    if not session_token:
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Please login."
+        )
+
+    user = validate_session(
+        session_token
+    )
+
+    if user is None:
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired or invalid. Please login again."
+        )
+
+    return {
+        "session_token": session_token,
+        "user": user
+    }
+
+
+# ==========================================
+# 7. AUTHENTICATION + CSRF DEPENDENCY
+# ==========================================
+
+def require_csrf(
+    request: Request,
+    context: dict = Depends(
+        get_authenticated_context
+    )
+) -> dict:
+
+    validate_request_origin(request)
+
+    csrf_cookie = request.cookies.get(
+        CSRF_COOKIE
+    )
+
+    csrf_header = request.headers.get(
+        "X-CSRF-Token"
+    )
+
+    if (
+        not csrf_cookie
+        or not csrf_header
+        or not hmac.compare_digest(
+            csrf_cookie,
+            csrf_header
+        )
+    ):
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CSRF validation failed."
+        )
+
+    if not validate_csrf_token(
+        context["session_token"],
+        csrf_header
+    ):
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid CSRF token."
+        )
+
+    return context
+
+
+# ==========================================
+# 8. PYDANTIC REQUEST MODELS
 # ==========================================
 
 class RegisterRequest(BaseModel):
+
+    model_config = ConfigDict(
+        extra="forbid"
+    )
 
     display_name: str = Field(
         min_length=1,
@@ -90,11 +370,11 @@ class RegisterRequest(BaseModel):
     )
 
 
-# ==========================================
-# 3. LOGIN REQUEST MODEL
-# ==========================================
-
 class LoginRequest(BaseModel):
+
+    model_config = ConfigDict(
+        extra="forbid"
+    )
 
     email: str = Field(
         min_length=5,
@@ -107,8 +387,25 @@ class LoginRequest(BaseModel):
     )
 
 
+class ChatRequest(BaseModel):
+
+    model_config = ConfigDict(
+        extra="forbid"
+    )
+
+    thread_id: str = Field(
+        min_length=1,
+        max_length=256
+    )
+
+    message: str = Field(
+        min_length=1,
+        max_length=5000
+    )
+
+
 # ==========================================
-# 4. USER RESPONSE MODEL
+# 9. PYDANTIC RESPONSE MODELS
 # ==========================================
 
 class UserResponse(BaseModel):
@@ -122,10 +419,6 @@ class UserResponse(BaseModel):
     created_at: str
 
 
-# ==========================================
-# 5. LOGIN RESPONSE MODEL
-# ==========================================
-
 class LoginResponse(BaseModel):
 
     message: str
@@ -133,22 +426,192 @@ class LoginResponse(BaseModel):
     user: UserResponse
 
 
+class ThreadCreateResponse(BaseModel):
+
+    message: str
+
+    thread_id: str
+
+
+class ThreadResponse(BaseModel):
+
+    thread_id: str
+
+    created_at: str
+
+
+class ChatResponse(BaseModel):
+
+    thread_id: str
+
+    answer: str
+
+
+class HistoryMessage(BaseModel):
+
+    role: Literal[
+        "user",
+        "assistant"
+    ]
+
+    content: str
+
+
+class ConversationHistoryResponse(BaseModel):
+
+    thread_id: str
+
+    messages: list[HistoryMessage]
+
+
 # ==========================================
-# 6. ROOT ENDPOINT
+# 10. CONVERSATION OWNERSHIP HELPER
+# ==========================================
+
+def user_owns_thread(
+    session_token: str,
+    thread_id: str
+) -> bool:
+
+    threads = list_authenticated_threads(
+        session_token
+    )
+
+    return any(
+        thread.get("thread_id") == thread_id
+        for thread in threads
+    )
+
+
+# ==========================================
+# 11. MESSAGE SERIALIZATION
+# ==========================================
+
+def extract_message_text(content) -> str:
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+
+        parts = []
+
+        for block in content:
+
+            if isinstance(block, str):
+
+                parts.append(block)
+
+            elif isinstance(block, dict):
+
+                if isinstance(
+                    block.get("text"),
+                    str
+                ):
+                    parts.append(
+                        block["text"]
+                    )
+
+        return "\n".join(parts).strip()
+
+    return ""
+
+
+def serialize_conversation_history(
+    messages
+) -> list[dict]:
+
+    result = []
+
+    for message in messages:
+
+        message_type = getattr(
+            message,
+            "type",
+            ""
+        )
+
+        if message_type == "human":
+            role = "user"
+
+        elif message_type == "ai":
+            role = "assistant"
+
+        else:
+            # Hide system and internal tool messages.
+            continue
+
+        content = extract_message_text(
+            getattr(message, "content", "")
+        )
+
+        if not content:
+            continue
+
+        result.append({
+            "role": role,
+            "content": content
+        })
+
+    return result
+
+
+# ==========================================
+# 12. CREATE FASTAPI APPLICATION
+# ==========================================
+
+app = FastAPI(
+    title="Odhikar BD API",
+    description=(
+        "AI-Powered Bangladesh Traffic Law Assistant"
+    ),
+    version="2.0.0"
+)
+
+
+# ==========================================
+# 13. CORS CONFIGURATION
+# ==========================================
+
+if ALLOWED_ORIGINS:
+
+    app.add_middleware(
+        CORSMiddleware,
+
+        allow_origins=ALLOWED_ORIGINS,
+
+        allow_credentials=True,
+
+        allow_methods=[
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS"
+        ],
+
+        allow_headers=[
+            "Content-Type",
+            "X-CSRF-Token"
+        ]
+    )
+
+
+# ==========================================
+# 14. ROOT ENDPOINT
 # ==========================================
 
 @app.get("/")
 def root():
 
     return {
-        "application": "Odhikar BD",
+        "application": APP_NAME,
         "message": "Welcome to Odhikar BD API",
         "status": "running"
     }
 
 
 # ==========================================
-# 7. HEALTH CHECK
+# 15. HEALTH CHECK
 # ==========================================
 
 @app.get("/health")
@@ -156,13 +619,13 @@ def health_check():
 
     return {
         "status": "healthy",
-        "application": "Odhikar BD",
-        "version": "1.0.0"
+        "application": APP_NAME,
+        "version": app.version
     }
 
 
 # ==========================================
-# 8. USER REGISTRATION API
+# 16. USER REGISTRATION
 # ==========================================
 
 @app.post(
@@ -170,7 +633,14 @@ def health_check():
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED
 )
-def register(request: RegisterRequest):
+def register(
+    request: RegisterRequest,
+    http_request: Request
+):
+
+    validate_request_origin(
+        http_request
+    )
 
     try:
 
@@ -199,7 +669,7 @@ def register(request: RegisterRequest):
 
 
 # ==========================================
-# 9. USER LOGIN API
+# 17. USER LOGIN
 # ==========================================
 
 @app.post(
@@ -208,38 +678,54 @@ def register(request: RegisterRequest):
 )
 def login(
     request: LoginRequest,
-    response: Response
+    response: Response,
+    http_request: Request
 ):
 
-    # Authenticate user and create session
+    validate_request_origin(
+        http_request
+    )
+
+    client_ip = get_client_ip(
+        http_request
+    )
+
+    check_login_rate_limit(
+        client_ip
+    )
+
     result = login_with_session(
         email=request.email,
         password=request.password
     )
 
-    # Reject invalid credentials
     if result is None:
+
+        record_failed_login(
+            client_ip
+        )
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password."
         )
 
-    # Retrieve session token
+    clear_login_failures(
+        client_ip
+    )
+
     session_token = result["session_token"]
 
-    # Store token in secure browser cookie
     response.set_cookie(
-        key="odhikar_session",
+        key=SESSION_COOKIE,
         value=session_token,
         httponly=True,
-        secure=False,  # Development only
-        samesite="lax",
-        max_age=24 * 60 * 60,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        max_age=SESSION_MAX_AGE,
         path="/"
     )
 
-    # Return public user information
     return {
         "message": "Login successful.",
         "user": result["user"]
@@ -247,7 +733,38 @@ def login(
 
 
 # ==========================================
-# 10. USER LOGOUT API
+# 18. GET CSRF TOKEN
+# ==========================================
+
+@app.get("/csrf-token")
+def get_csrf_token(
+    response: Response,
+    context: dict = Depends(
+        get_authenticated_context
+    )
+):
+
+    csrf_token = generate_csrf_token(
+        context["session_token"]
+    )
+
+    response.set_cookie(
+        key=CSRF_COOKIE,
+        value=csrf_token,
+        httponly=False,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        max_age=SESSION_MAX_AGE,
+        path="/"
+    )
+
+    return {
+        "csrf_token": csrf_token
+    }
+
+
+# ==========================================
+# 19. USER LOGOUT
 # ==========================================
 
 @app.post("/logout")
@@ -256,160 +773,198 @@ def logout(
     response: Response
 ):
 
-    # Retrieve session cookie
-    session_token = request.cookies.get(
-        "odhikar_session"
+    validate_request_origin(
+        request
     )
 
-    # Revoke session in SQLite
+    session_token = request.cookies.get(
+        SESSION_COOKIE
+    )
+
     revoked = False
 
     if session_token:
+
+        csrf_cookie = request.cookies.get(
+            CSRF_COOKIE
+        )
+
+        csrf_header = request.headers.get(
+            "X-CSRF-Token"
+        )
+
+        if (
+            not csrf_cookie
+            or not csrf_header
+            or not hmac.compare_digest(
+                csrf_cookie,
+                csrf_header
+            )
+            or not validate_csrf_token(
+                session_token,
+                csrf_header
+            )
+        ):
+
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF validation failed."
+            )
 
         revoked = logout_session(
             session_token
         )
 
-    # Remove browser cookie
     response.delete_cookie(
-        key="odhikar_session",
+        key=SESSION_COOKIE,
         httponly=True,
-        secure=False,  # Development only
-        samesite="lax",
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
         path="/"
     )
 
-    if revoked:
-
-        return {
-            "message": "Logout successful.",
-            "status": "logged_out"
-        }
+    response.delete_cookie(
+        key=CSRF_COOKIE,
+        httponly=False,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        path="/"
+    )
 
     return {
-        "message": "No active session.",
-        "status": "already_logged_out"
+        "message": "Logout successful.",
+        "status": (
+            "logged_out"
+            if revoked
+            else "already_logged_out"
+        )
     }
 
+
 # ==========================================
-# 11. GET CURRENT USER API
+# 20. GET CURRENT USER
 # ==========================================
 
 @app.get(
     "/me",
     response_model=UserResponse
 )
-def get_current_user(request: Request):
+def get_current_user(
+    context: dict = Depends(
+        get_authenticated_context
+    )
+):
 
-    # Retrieve session token from browser cookie
-    session_token = request.cookies.get(
-        "odhikar_session"
+    return context["user"]
+
+
+# ==========================================
+# 21. CREATE AUTHENTICATED CONVERSATION
+# ==========================================
+
+@app.post(
+    "/threads",
+    response_model=ThreadCreateResponse,
+    status_code=status.HTTP_201_CREATED
+)
+def create_thread(
+    context: dict = Depends(
+        require_csrf
+    )
+):
+
+    thread_id = create_authenticated_thread(
+        context["session_token"]
     )
 
-    # Check whether session exists
-    if not session_token:
+    if thread_id is None:
 
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required. Please login."
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to create conversation."
         )
 
-    # Validate session
-    user = validate_session(session_token)
-
-    # Reject invalid or expired sessions
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired or invalid. Please login again."
-        )
-
-    # Return authenticated user information
-    return user
-
-# ==========================================
-# 12. THREAD RESPONSE MODEL
-# ==========================================
-
-class ThreadResponse(BaseModel):
-
-    thread_id: str
-
-    user_id: str
-
-    created_at: str
+    return {
+        "message": "Conversation created successfully.",
+        "thread_id": thread_id
+    }
 
 
 # ==========================================
-# 14. LIST USER CONVERSATIONS API
+# 22. LIST USER CONVERSATIONS
 # ==========================================
 
 @app.get(
     "/threads",
     response_model=list[ThreadResponse]
 )
-def get_threads(request: Request):
+def get_threads(
+    context: dict = Depends(
+        get_authenticated_context
+    )
+):
 
-    # STEP 1: Get session token
-    session_token = request.cookies.get(
-        "odhikar_session"
+    threads = list_authenticated_threads(
+        context["session_token"]
     )
 
-    if not session_token:
+    return [
+        {
+            "thread_id": thread["thread_id"],
+            "created_at": thread["created_at"]
+        }
+        for thread in threads
+    ]
+
+
+# ==========================================
+# 23. GET CONVERSATION HISTORY
+# ==========================================
+
+@app.get(
+    "/threads/{thread_id}/messages",
+    response_model=ConversationHistoryResponse
+)
+def get_thread_messages(
+    thread_id: str = Path(
+        min_length=1,
+        max_length=256
+    ),
+    context: dict = Depends(
+        get_authenticated_context
+    )
+):
+
+    thread_id = thread_id.strip()
+
+    # Verify ownership before reading history.
+    if not user_owns_thread(
+        context["session_token"],
+        thread_id
+    ):
 
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found."
         )
 
-    # STEP 2: Validate session
-    user = validate_session(session_token)
-
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session."
-        )
-
-    # STEP 3: Get conversations of current user
-    threads = list_user_threads(
-        user["user_id"]
+    messages = get_authenticated_thread_history(
+        context["session_token"],
+        thread_id
     )
 
-    return threads
-
-# ==========================================
-# 15. CHAT REQUEST MODEL
-# ==========================================
-
-class ChatRequest(BaseModel):
-
-    thread_id: str = Field(
-        min_length=1,
-        max_length=100
+    serialized_messages = serialize_conversation_history(
+        messages
     )
 
-    message: str = Field(
-        min_length=1,
-        max_length=5000
-    )
+    return {
+        "thread_id": thread_id,
+        "messages": serialized_messages
+    }
 
 
 # ==========================================
-# 16. CHAT RESPONSE MODEL
-# ==========================================
-
-class ChatResponse(BaseModel):
-
-    thread_id: str
-
-    answer: str
-
-
-# ==========================================
-# 17. AI CHAT API
+# 24. AI CHAT API
 # ==========================================
 
 @app.post(
@@ -417,39 +972,11 @@ class ChatResponse(BaseModel):
     response_model=ChatResponse
 )
 def chat(
-    request: Request,
-    chat_request: ChatRequest
+    chat_request: ChatRequest,
+    context: dict = Depends(
+        require_csrf
+    )
 ):
-
-    # STEP 1: GET SESSION TOKEN
-
-    session_token = request.cookies.get(
-        "odhikar_session"
-    )
-
-    if not session_token:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first."
-        )
-
-
-    # STEP 2: VALIDATE SESSION
-
-    user = validate_session(
-        session_token
-    )
-
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session."
-        )
-
-
-    # STEP 3: VALIDATE MESSAGE
 
     thread_id = chat_request.thread_id.strip()
 
@@ -462,129 +989,54 @@ def chat(
             detail="Thread ID and message are required."
         )
 
-
-    # STEP 4: CHECK THREAD OWNERSHIP
-
-    user_threads = list_user_threads(
-        user["user_id"]
+    answer = ask_in_authenticated_thread(
+        session_token=context["session_token"],
+        thread_id=thread_id,
+        query=message
     )
 
-    owns_thread = any(
-        thread["thread_id"] == thread_id
-        for thread in user_threads
-    )
-
-    if not owns_thread:
+    if answer.startswith("Access denied"):
 
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: This conversation does not belong to this user."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found."
         )
 
+    if answer.startswith("Authentication required"):
 
-    # STEP 5: SEND QUESTION TO LANGGRAPH
-
-    answer = ask_in_thread(
-        message,
-        thread_id
-    )
-
-
-    # STEP 6: RETURN AI RESPONSE
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required."
+        )
 
     return {
         "thread_id": thread_id,
         "answer": answer
     }
 
-# ==========================================
-# 18. DELETE CONVERSATION API
-# ==========================================
-
-@app.delete("/threads/{thread_id}")
-def delete_conversation(
-    thread_id: str,
-    request: Request
-):
-
-    # STEP 1: Get session
-    session_token = request.cookies.get(
-        "odhikar_session"
-    )
-
-    if not session_token:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first."
-        )
-
-    # STEP 2: Validate session
-    user = validate_session(session_token)
-
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session."
-        )
-
-    # STEP 3: Delete owned conversation
-    deleted = delete_owned_thread(
-        user["user_id"],
-        thread_id
-    )
-
-    if not deleted:
-
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conversation not found or could not be deleted."
-        )
-
-    # STEP 4: Return confirmation
-    return {
-        "message": "Conversation deleted successfully.",
-        "thread_id": thread_id,
-        "status": "deleted"
-    }
 
 # ==========================================
-# 19. RESET CONVERSATION API
+# 25. RESET AUTHENTICATED CONVERSATION
 # ==========================================
 
-@app.post("/threads/{thread_id}/reset")
+@app.post(
+    "/threads/{thread_id}/reset"
+)
 def reset_conversation(
-    thread_id: str,
-    request: Request
+    thread_id: str = Path(
+        min_length=1,
+        max_length=256
+    ),
+    context: dict = Depends(
+        require_csrf
+    )
 ):
 
-    # STEP 1: Get session token
-    session_token = request.cookies.get(
-        "odhikar_session"
-    )
+    thread_id = thread_id.strip()
 
-    if not session_token:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first."
-        )
-
-    # STEP 2: Validate session
-    user = validate_session(session_token)
-
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session."
-        )
-
-    # STEP 3: Reset owned conversation
-    reset_success = reset_owned_thread(
-        user["user_id"],
-        thread_id
+    reset_success = reset_authenticated_thread(
+        session_token=context["session_token"],
+        thread_id=thread_id
     )
 
     if not reset_success:
@@ -594,77 +1046,46 @@ def reset_conversation(
             detail="Conversation not found or could not be reset."
         )
 
-    # STEP 4: Return confirmation
     return {
         "message": "Conversation reset successfully.",
         "thread_id": thread_id,
         "status": "reset"
     }
 
+
 # ==========================================
-# 13. CREATE NEW CONVERSATION API
+# 26. DELETE AUTHENTICATED CONVERSATION
 # ==========================================
 
-@app.post(
-    "/threads",
-    response_model=ThreadResponse,
-    status_code=status.HTTP_201_CREATED
+@app.delete(
+    "/threads/{thread_id}"
 )
-def create_thread(request: Request):
+def delete_conversation(
+    thread_id: str = Path(
+        min_length=1,
+        max_length=256
+    ),
+    context: dict = Depends(
+        require_csrf
+    )
+):
 
-    # STEP 1: Get session token
-    session_token = request.cookies.get(
-        "odhikar_session"
+    thread_id = thread_id.strip()
+
+    deleted = delete_authenticated_thread(
+        session_token=context["session_token"],
+        thread_id=thread_id
     )
 
-    if not session_token:
+    if not deleted:
 
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Please login first."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found or could not be deleted."
         )
 
-    # STEP 2: Validate session
-    user = validate_session(session_token)
-
-    if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session."
-        )
-
-    # STEP 3: Create thread for authenticated user
-    thread_id = create_user_thread(
-        user["user_id"]
-    )
-
-    if not thread_id:
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not create conversation."
-        )
-
-    # STEP 4: Retrieve created thread
-    threads = list_user_threads(
-        user["user_id"]
-    )
-
-    created_thread = next(
-        (
-            thread for thread in threads
-            if thread["thread_id"] == thread_id
-        ),
-        None
-    )
-
-    if created_thread is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Created conversation could not be verified."
-        )
-
-    # STEP 5: Return conversation
-    return created_thread
+    return {
+        "message": "Conversation deleted successfully.",
+        "thread_id": thread_id,
+        "status": "deleted"
+    }
