@@ -24,6 +24,8 @@ import {
 } from "lucide-react";
 
 import "./App.css";
+import { ApiError, chatApi, type History, type Usage } from "./api/client";
+import type { AuthControls } from "./components/AuthGate";
 
 // ============================================
 // TYPES
@@ -87,10 +89,6 @@ const quickQuestions = [
   },
 ];
 
-const DEMO_REPLY =
-  "Frontend preview: Your message was received locally. " +
-  "The FastAPI, LangGraph and Gemini backend has not " +
-  "been connected to this interface yet.";
 
 // ============================================
 // SIMPLE O + LAW BRAND LOGO
@@ -387,7 +385,7 @@ function CircleWave({
 // MAIN APP
 // ============================================
 
-export default function App() {
+export default function App({ session, openAuth, signOut }: AuthControls) {
   const [conversations, setConversations] = useState<
     Conversation[]
   >([]);
@@ -398,6 +396,11 @@ export default function App() {
 
   const [draft, setDraft] = useState("");
   const [thinking, setThinking] = useState(false);
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [error, setError] = useState("");
+  const [limitReached, setLimitReached] = useState(false);
+  const sendingRef = useRef(false);
+  const liveRef = useRef(true);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] =
@@ -409,9 +412,50 @@ export default function App() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const timerRef = useRef<
-    ReturnType<typeof setTimeout> | null
-  >(null);
+  const mode = session.mode;
+
+  function titleFromHistory(history: History): string {
+    const first = history.messages.find((m) => m.role === "user")?.content;
+    return first ? (first.length > 44 ? first.slice(0, 44) + "…" : first) : "New conversation";
+  }
+
+  async function refreshUsage() {
+    try {
+      const current = await chatApi.usage();
+      if (liveRef.current) setUsage(current);
+    } catch (err) {
+      if (liveRef.current) setError(err instanceof Error ? err.message : "Unable to load quota.");
+    }
+  }
+
+  useEffect(() => {
+    liveRef.current = true;
+    async function load() {
+      try {
+        const [threads, quota] = await Promise.all([chatApi.threads(mode), chatApi.usage()]);
+        if (!liveRef.current) return;
+        setUsage(quota);
+        // Load conversations with first-question titles, in parallel.
+        const histories = await Promise.all(threads.map(async (t) => {
+          try { return await chatApi.history(mode, t.thread_id); }
+          catch { return { thread_id: t.thread_id, messages: [] } as History; }
+        }));
+        if (!liveRef.current) return;
+        setConversations(histories.map((history) => ({
+          id: history.thread_id,
+          title: titleFromHistory(history),
+          messages: history.messages.map((message) => ({
+            id: crypto.randomUUID(), role: message.role === "user" ? "user" as const : "notice" as const,
+            content: message.content,
+          })),
+        })));
+      } catch (err) {
+        if (liveRef.current) setError(err instanceof Error ? err.message : "Unable to load chats.");
+      }
+    }
+    void load();
+    return () => { liveRef.current = false; };
+  }, [mode]);
 
   const currentConversation = conversations.find(
     (conversation) => conversation.id === activeId
@@ -429,59 +473,40 @@ export default function App() {
   );
 
   // ------------------------------------------
-  // STOP LOADING DEMO
-  // ------------------------------------------
-
-  function cancelThinking() {
-    if (timerRef.current !== null) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
-
-    setThinking(false);
-  }
-
-  // ------------------------------------------
-  // NEW CHAT
+  // CHAT NAVIGATION (avoid switching mid-request)
   // ------------------------------------------
 
   function newChat() {
-    cancelThinking();
+    if (sendingRef.current) return;
     setActiveId(null);
     setDraft("");
+    setError("");
     setSidebarOpen(false);
-
-    requestAnimationFrame(() => {
-      inputRef.current?.focus();
-    });
+    requestAnimationFrame(() => inputRef.current?.focus());
   }
-
-  // ------------------------------------------
-  // OPEN CHAT
-  // ------------------------------------------
 
   function openChat(id: string) {
-    cancelThinking();
+    if (sendingRef.current) return;
     setActiveId(id);
     setDraft("");
+    setError("");
     setSidebarOpen(false);
   }
 
-  // ------------------------------------------
-  // DELETE CHAT
-  // ------------------------------------------
-
-  function deleteChat(id: string) {
-    if (activeId === id) {
-      cancelThinking();
-      setActiveId(null);
+  async function deleteChat(id: string) {
+    if (sendingRef.current) return;
+    // Guest deletion is intentionally unavailable: no guest DELETE route exists.
+    if (mode === "guest") {
+      setError("Guest chat deletion is not yet supported by the backend.");
+      return;
     }
-
-    setConversations((previous) =>
-      previous.filter(
-        (conversation) => conversation.id !== id
-      )
-    );
+    try {
+      await chatApi.delete(id);
+      setConversations((previous) => previous.filter((c) => c.id !== id));
+      if (activeId === id) setActiveId(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to delete chat.");
+    }
   }
 
   // ------------------------------------------
@@ -494,84 +519,71 @@ export default function App() {
   }
 
   // ------------------------------------------
-  // SEND MESSAGE
+  // REAL BACKEND AI CHAT
   // ------------------------------------------
 
-  function sendMessage(event: FormEvent<HTMLFormElement>) {
+  async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     const question = draft.trim();
+    if (!question || sendingRef.current) return;
+    if (usage && usage.remaining <= 0) {
+      setLimitReached(true);
+      return;
+    }
 
-    if (!question || thinking) return;
-
-    const id = activeId ?? crypto.randomUUID();
-
-    const newMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: question,
-    };
-
-    setConversations((previous) => {
-      const existing = previous.find(
-        (conversation) => conversation.id === id
-      );
-
-      if (existing) {
-        return previous.map((conversation) =>
-          conversation.id === id
-            ? {
-                ...conversation,
-                messages: [
-                  ...conversation.messages,
-                  newMessage,
-                ],
-              }
-            : conversation
-        );
-      }
-
-      return [
-        {
-          id,
-          title:
-            question.length > 44
-              ? `${question.slice(0, 44)}…`
-              : question,
-          messages: [newMessage],
-        },
-        ...previous,
-      ];
-    });
-
-    setActiveId(id);
-    setDraft("");
+    sendingRef.current = true;
     setThinking(true);
+    setError("");
+    let id = activeId;
 
-    // FRONTEND PREVIEW ONLY
-    // This timer will be replaced with real API calls.
-    timerRef.current = setTimeout(() => {
-      setConversations((previous) =>
-        previous.map((conversation) =>
-          conversation.id === id
-            ? {
-                ...conversation,
-                messages: [
-                  ...conversation.messages,
-                  {
-                    id: crypto.randomUUID(),
-                    role: "notice",
-                    content: DEMO_REPLY,
-                  },
-                ],
-              }
-            : conversation
-        )
-      );
+    try {
+      if (!id) {
+        const created = await chatApi.create(mode);
+        id = created.thread_id;
+        setConversations((previous) => [{ id: created.thread_id, title: question.slice(0, 44), messages: [] }, ...previous]);
+        setActiveId(id);
+      }
+      const threadId = id;
+      const newMessage: ChatMessage = {
+        id: crypto.randomUUID(), role: "user", content: question,
+      };
+      setConversations((previous) => previous.map((c) =>
+        c.id === threadId ? {
+          ...c,
+          title: c.messages.length === 0 ? (question.length > 44 ? question.slice(0, 44) + "…" : question) : c.title,
+          messages: [...c.messages, newMessage],
+        } : c
+      ));
+      setDraft("");
 
-      setThinking(false);
-      timerRef.current = null;
-    }, 2500);
+      const reply = await chatApi.send(mode, threadId, question);
+      if (liveRef.current) {
+        setConversations((previous) => previous.map((c) => c.id === threadId ? {
+          ...c,
+          messages: [...c.messages, { id: crypto.randomUUID(), role: "notice" as const, content: reply.answer }],
+        } : c));
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 429) setLimitReached(true);
+      if (liveRef.current) setError(err instanceof Error ? err.message : "Unable to send message.");
+      // Refresh the server-authoritative history in case the Gemini call failed after accepting the message.
+      if (id) {
+        try {
+          const history = await chatApi.history(mode, id);
+          if (liveRef.current) setConversations((previous) => previous.map((c) => c.id === id ? {
+            ...c,
+            title: titleFromHistory(history),
+            messages: history.messages.map((m) => ({ id: crypto.randomUUID(), role: m.role === "user" ? "user" as const : "notice" as const, content: m.content })),
+          } : c));
+        } catch { /* Keep visible error; backend may be offline. */ }
+      }
+    } finally {
+      sendingRef.current = false;
+      if (liveRef.current) {
+        setThinking(false);
+        void refreshUsage();
+      }
+    }
   }
 
   // ------------------------------------------
@@ -604,12 +616,7 @@ export default function App() {
       ) {
         event.preventDefault();
 
-        if (timerRef.current !== null) {
-          clearTimeout(timerRef.current);
-          timerRef.current = null;
-        }
-
-        setThinking(false);
+        if (sendingRef.current) return;
         setActiveId(null);
         setDraft("");
         setSidebarOpen(false);
@@ -643,18 +650,6 @@ export default function App() {
       });
     }
   }, [thinking, currentConversation?.messages.length, hasMessages]);
-
-  // ------------------------------------------
-  // CLEAN UP TIMER WHEN UNMOUNTING
-  // ------------------------------------------
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current !== null) {
-        clearTimeout(timerRef.current);
-      }
-    };
-  }, []);
 
   return (
     <div
@@ -832,10 +827,9 @@ export default function App() {
                         className="conversation-delete"
                         type="button"
                         aria-label={`Delete ${conversation.title}`}
-                        title="Delete conversation"
-                        onClick={() =>
-                          deleteChat(conversation.id)
-                        }
+                        title={mode === "guest" ? "Guest deletion is unavailable" : "Delete conversation"}
+                        disabled={mode === "guest" || thinking}
+                        onClick={() => { void deleteChat(conversation.id); }}
                       >
                         <Trash2 size={15} />
                       </button>
@@ -892,20 +886,35 @@ export default function App() {
           </div>
 
           <div className="topbar-right">
+            {usage && <span style={{ fontSize: 12, color: "#7044B7", fontWeight: 600 }} title="Messages remaining">{usage.remaining}/{usage.limit} left</span>}
+            {mode === "guest" ? (
+              <button type="button" onClick={openAuth} style={{ border: "1px solid #d6c6ec", borderRadius: 9, padding: "7px 10px", background: "white", color: "#7044B7", cursor: "pointer" }}>Sign in</button>
+            ) : (
+              <button type="button" onClick={() => { void signOut().catch((err: unknown) => setError(err instanceof Error ? err.message : "Logout failed.")); }} style={{ border: "1px solid #e5dced", borderRadius: 9, padding: "7px 10px", background: "white", color: "#7044B7", cursor: "pointer" }}>Sign out</button>
+            )}
             <span className="preview-indicator">
               <span className="preview-dot" />
-              FRONTEND PREVIEW
+              {mode === "guest" ? "GUEST MODE" : "SIGNED IN"}
             </span>
 
             <span
               className="topbar-avatar"
-              aria-label="Odhikar BD preview"
+              aria-label={mode === "guest" ? "Guest account" : session.user?.display_name ?? "Account"}
             >
-              O
+              {mode === "guest" ? "G" : (session.user?.display_name?.[0]?.toUpperCase() ?? "O")}
             </span>
           </div>
         </header>
 
+        {error && <div role="alert" style={{ padding: "10px 18px", margin: "10px 20px 0", background: "#fff1f3", color: "#a63854", borderRadius: 10, fontSize: 13 }}>{error}</div>}
+        {limitReached && <div role="dialog" aria-modal="true" aria-label="Message limit reached" style={{ position: "fixed", inset: 0, zIndex: 500, background: "#25133977", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div style={{ maxWidth: 390, width: "100%", borderRadius: 20, background: "#fff", padding: 28, boxShadow: "0 15px 60px #25133933" }}>
+            <h2 style={{ margin: "0 0 10px", color: "#7044B7" }}>Message limit reached</h2>
+            <p style={{ lineHeight: 1.7, fontSize: 14 }}>{mode === "guest" ? "You have used your 5 guest messages. Sign in to access 30 messages each day." : "You have used today's 30 messages. Your quota resets at midnight Bangladesh time."}</p>
+            {mode === "guest" && <button type="button" onClick={() => { setLimitReached(false); openAuth(); }} style={{ background: "#7044B7", border: 0, color: "white", borderRadius: 9, padding: "11px 18px", marginRight: 10 }}>Sign in / Register</button>}
+            <button type="button" onClick={() => setLimitReached(false)} style={{ border: "1px solid #e4d9f1", background: "white", color: "#7044B7", borderRadius: 9, padding: "11px 18px" }}>Close</button>
+          </div>
+        </div>}
         <main className="main-content">
           {!hasMessages ? (
             // HOME SCREEN
@@ -1004,7 +1013,7 @@ export default function App() {
                         Processing your question
                       </strong>
                       <span>
-                        Frontend animation preview
+                        Checking Bangladesh traffic-law information…
                       </span>
                     </div>
                   </div>
