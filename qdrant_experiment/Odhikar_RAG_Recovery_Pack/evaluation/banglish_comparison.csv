@@ -1,0 +1,13 @@
+﻿language,query,expected_section,expanded_query,baseline_rank,expanded_rank,baseline_top1,expanded_top1,baseline_recall5,expanded_recall5
+bn,লাইসেন্স ছাড়া মোটরযান চালাতে পারবো?,4,লাইসেন্স ছাড়া মোটরযান চালাতে পারবো?,1,1,1,1,1,1
+bn,ড্রাইভিং লাইসেন্স নবায়ন করার নিয়ম,6,ড্রাইভিং লাইসেন্স নবায়ন করার নিয়ম,,,0,0,0,0
+bn,লাইসেন্স বাতিল বা স্থগিত,12,লাইসেন্স বাতিল বা স্থগিত,1,1,1,1,1,1
+bn,গাড়ির গতিসীমা নিয়ন্ত্রণ,44,গাড়ির গতিসীমা নিয়ন্ত্রণ,1,1,1,1,1,1
+bn,শব্দমাত্রা নিয়ন্ত্রণ,45,শব্দমাত্রা নিয়ন্ত্রণ,1,1,1,1,1,1
+bn,মহাসড়ক ব্যবহার,48,মহাসড়ক ব্যবহার,4,4,0,0,1,1
+bn,ট্রাফিক সাইন না মানলে,85,ট্রাফিক সাইন না মানলে,3,3,0,0,1,1
+banglish,license chara gari chalano jabe?,4,license chara gari chalano jabe? লাইসেন্স ব্যতীত মোটরযান চালনা বিধি নিষেধ,,1,0,1,0,1
+banglish,driving license renew korbo kivabe?,6,driving license renew korbo kivabe? ড্রাইভিং লাইসেন্স নবায়ন,,,0,0,0,0
+banglish,gari speed limit kotho?,44,gari speed limit kotho? গতিসীমা মোটরযান,,1,0,1,0,1
+explicit,ধারা ৪ ড্রাইভিং লাইসেন্স,4,ধারা ৪ ড্রাইভিং লাইসেন্স,1,1,1,1,1,1
+explicit,ধারা ৪৫ শব্দমাত্রা,45,ধারা ৪৫ শব্দমাত্রা,1,1,1,1,1,1

@@ -126,3 +126,72 @@ desktop.ini
 /ocr_models/
 /data/
 
+
+# ============================================
+# ODHIKAR BD - ADDITIONAL PROJECT EXCLUSIONS
+# ============================================
+
+# Qdrant local vector database
+qdrant_storage/
+qdrant_data/
+qdrant_local/
+qdrant_db/
+**/qdrant_storage/
+**/qdrant_data/
+**/qdrant_local/
+**/qdrant_db/
+
+# Draft legal RAG datasets
+**/rag_data/
+**/source_pages_47_DRAFT/
+**/verified_unicode_batch*/
+
+# Legal verification working folders
+/review_77/
+/review_full_audit/
+/review_final_checkpoint/
+/review_84_consolidated/
+
+# Generated cleanup reports and archives
+/_cleanup_audit/
+/_cleanup_archive/
+/Odhikar_Cleanup_Report*.zip
+/exact_duplicates_SHA256.csv
+
+# Generated local evaluations
+**/qdrant_v2_comparison.csv
+
+# Downloaded model weights and checkpoints
+**/checkpoints/
+**/model_weights/
+
+# Exported project archives
+*.zip
+
+# Legal source PDFs (stored locally)
+*.pdf
+
+# Additional credential files
+credentials.json
+service-account*.json
+*.p12
+*.pfx
+
+# Odhikar BD - draft legal verification
+/Odhikar_BD_Gazette_Verification_Next/
+/review_strict_77/
+
+# Legal source pages and OCR drafts
+**/source_pages/
+**/source_pages_corrected_DRAFT/
+**/rag_data/
+
+# Local Qdrant indexes
+**/local_indexes/
+
+# Generated evidence and review reports
+/RAG_Recovery_Pack/reports/
+/qdrant_experiment/Odhikar_RAG_Recovery_Pack/reports/
+
+# Suspicious temporary root file
+/1

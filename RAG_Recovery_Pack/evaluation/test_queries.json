@@ -1,0 +1,74 @@
+[
+  {
+    "language": "bn",
+    "query": "লাইসেন্স ছাড়া মোটরযান চালাতে পারবো?",
+    "expected_section": 4,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "ড্রাইভিং লাইসেন্স নবায়ন করার নিয়ম",
+    "expected_section": 6,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "লাইসেন্স বাতিল বা স্থগিত",
+    "expected_section": 12,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "গাড়ির গতিসীমা নিয়ন্ত্রণ",
+    "expected_section": 44,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "শব্দমাত্রা নিয়ন্ত্রণ",
+    "expected_section": 45,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "মহাসড়ক ব্যবহার",
+    "expected_section": 48,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "bn",
+    "query": "ট্রাফিক সাইন না মানলে",
+    "expected_section": 85,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "banglish",
+    "query": "license chara gari chalano jabe?",
+    "expected_section": 4,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "banglish",
+    "query": "driving license renew korbo kivabe?",
+    "expected_section": 6,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "banglish",
+    "query": "gari speed limit kotho?",
+    "expected_section": 44,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "explicit",
+    "query": "ধারা ৪ ড্রাইভিং লাইসেন্স",
+    "expected_section": 4,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  },
+  {
+    "language": "explicit",
+    "query": "ধারা ৪৫ শব্দমাত্রা",
+    "expected_section": 45,
+    "expectation_basis": "2018 draft section heading; unverified legal text"
+  }
+]
