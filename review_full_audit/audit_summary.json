@@ -1,0 +1,26 @@
+{
+  "status": "DRAFT_ONLY",
+  "release_gate": "BLOCKED",
+  "input_source_pdf_sha256": "1550b97f3406008fa99708826999539c3ab64aa510ba0e4d57140f9ff30eeb9a",
+  "pdf_pages": 47,
+  "page_text_files": 47,
+  "fresh_targeted_corrections": 4,
+  "changed_pages": [
+    20,
+    28,
+    44,
+    46
+  ],
+  "remaining_nonstandard_markers": 0,
+  "heuristic_latin_word_flags": 102,
+  "heuristic_ascii_numeric_flags": 839,
+  "review_77_records": 77,
+  "review_77_exact_excerpts_still_present": 77,
+  "strict_full_line_attested": 0,
+  "full_pages_legal_certified": 0,
+  "current_law_verified": false,
+  "source_pdf_copy_hash_matches": true,
+  "all_47_text_files_present": true,
+  "patch_scope": "Only four image-supported marker repairs; pre-existing corrections retained; no original files overwritten",
+  "verification_limits": "Heuristic structural audit != certified 47-page Gazette transcription; latin words and digits may be legitimate."
+}
