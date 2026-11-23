@@ -1,4 +1,4 @@
-
+import DraftPreviewPanel from "./DraftPreviewPanel";
 import {
   useEffect,
   useRef,
@@ -650,6 +650,14 @@ export default function App({ session, openAuth, signOut }: AuthControls) {
       });
     }
   }, [thinking, currentConversation?.messages.length, hasMessages]);
+
+// Development-only Draft AI Preview
+if (
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get("draft-preview") === "1"
+) {
+  return <DraftPreviewPanel />;
+}
 
   return (
     <div
