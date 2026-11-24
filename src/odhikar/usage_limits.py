@@ -17,15 +17,20 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.odhikar.database import DB_PATH
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_DB = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "odhikar_usage.sqlite"
-)
+# ==========================================
+# 1. CENTRAL DATABASE CONFIGURATION
+# ==========================================
+
+# All application modules use the same SQLite database.
+DEFAULT_DB = DB_PATH
+
+
+# ==========================================
+# 2. QUOTA CONFIGURATION
+# ==========================================
 
 GUEST_LIMIT = 5
 MEMBER_LIMIT = 30
@@ -36,8 +41,13 @@ DHAKA_OFFSET = 6 * 3_600
 GUEST_COOKIE = "odhikar_guest"
 
 
+# ==========================================
+# 3. QUOTA RESULT
+# ==========================================
+
 @dataclass(frozen=True)
 class QuotaResult:
+
     allowed: bool
     limit: int
     used: int
@@ -45,9 +55,14 @@ class QuotaResult:
     reset_at: int
 
 
+# ==========================================
+# 4. USAGE STORE
+# ==========================================
+
 class UsageStore:
 
     def __init__(self, db_path=DEFAULT_DB):
+
         self.db_path = Path(db_path)
 
         self.db_path.parent.mkdir(
@@ -57,7 +72,12 @@ class UsageStore:
 
         self._initialize()
 
+    # ======================================
+    # DATABASE CONNECTION
+    # ======================================
+
     def _connect(self):
+
         connection = sqlite3.connect(
             self.db_path,
             timeout=15,
@@ -66,56 +86,94 @@ class UsageStore:
 
         connection.row_factory = sqlite3.Row
 
+        # Enable foreign-key enforcement
+        # for every database connection.
         connection.execute(
-            "PRAGMA busy_timeout=15000"
+            "PRAGMA foreign_keys = ON"
+        )
+
+        # Wait for database locks.
+        connection.execute(
+            "PRAGMA busy_timeout = 15000"
         )
 
         return connection
 
+    # ======================================
+    # INITIALIZE DATABASE TABLES
+    # ======================================
+
     def _initialize(self):
+
         connection = self._connect()
 
         try:
+
             connection.executescript("""
+
                 CREATE TABLE IF NOT EXISTS guest_sessions (
+
                     token_hash TEXT PRIMARY KEY,
+
                     created_at INTEGER NOT NULL,
+
                     expires_at INTEGER NOT NULL
+
                 );
 
+
                 CREATE TABLE IF NOT EXISTS usage_events (
+
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                     principal_kind TEXT NOT NULL
+
                     CHECK (
                         principal_kind IN ('guest', 'member')
                     ),
 
                     principal_id TEXT NOT NULL,
+
                     occurred_at INTEGER NOT NULL
+
                 );
 
+
                 CREATE INDEX IF NOT EXISTS idx_usage_window
+
                 ON usage_events (
+
                     principal_kind,
+
                     principal_id,
+
                     occurred_at
+
                 );
+
             """)
+
         finally:
+
             connection.close()
+
+    # ======================================
+    # HASH GUEST TOKEN
+    # ======================================
 
     @staticmethod
     def _digest(value: str) -> str:
+
         return hashlib.sha256(
             value.encode("utf-8")
         ).hexdigest()
 
-    # ====================================
+    # ======================================
     # CREATE GUEST SESSION
-    # ====================================
+    # ======================================
 
     def create_guest(self, *, now=None):
+
         instant = (
             int(time.time())
             if now is None
@@ -125,27 +183,39 @@ class UsageStore:
         token = secrets.token_urlsafe(32)
 
         with closing(self._connect()) as conn:
+
             conn.execute(
                 """
+
                 INSERT INTO guest_sessions (
+
                     token_hash,
+
                     created_at,
+
                     expires_at
+
                 )
+
                 VALUES (?, ?, ?)
+
                 """,
+
                 (
                     self._digest(token),
+
                     instant,
+
                     instant + DAY_SECONDS
+
                 )
             )
 
         return token
 
-    # ====================================
+    # ======================================
     # VERIFY GUEST TOKEN
-    # ====================================
+    # ======================================
 
     def guest_principal(
         self,
@@ -153,6 +223,7 @@ class UsageStore:
         *,
         now=None
     ):
+
         if not token or len(token) > 256:
             return None
 
@@ -163,17 +234,27 @@ class UsageStore:
         )
 
         with closing(self._connect()) as conn:
+
             row = conn.execute(
                 """
+
                 SELECT token_hash
+
                 FROM guest_sessions
+
                 WHERE token_hash = ?
+
                   AND expires_at > ?
+
                 """,
+
                 (
                     self._digest(token),
+
                     instant
+
                 )
+
             ).fetchone()
 
         if row is None:
@@ -181,9 +262,9 @@ class UsageStore:
 
         return str(row["token_hash"])
 
-    # ====================================
+    # ======================================
     # ATOMIC QUOTA ENFORCEMENT
-    # ====================================
+    # ======================================
 
     def check_and_consume(
         self,
@@ -192,10 +273,14 @@ class UsageStore:
         *,
         now=None
     ):
+
         if kind not in ("guest", "member"):
             raise ValueError("Invalid account type")
 
-        if not principal_id or not principal_id.strip():
+        if (
+            not isinstance(principal_id, str)
+            or not principal_id.strip()
+        ):
             raise ValueError("Principal ID required")
 
         instant = (
@@ -205,9 +290,13 @@ class UsageStore:
         )
 
         if kind == "guest":
+
             limit = GUEST_LIMIT
+
             start = instant - DAY_SECONDS
+
         else:
+
             limit = MEMBER_LIMIT
 
             # Bangladesh calendar-day boundary
@@ -222,94 +311,151 @@ class UsageStore:
         conn = self._connect()
 
         try:
+
             # Prevent concurrent requests from
             # bypassing the quota.
             conn.execute("BEGIN IMMEDIATE")
 
             if kind == "guest":
+
                 valid = conn.execute(
                     """
+
                     SELECT 1
+
                     FROM guest_sessions
+
                     WHERE token_hash = ?
+
                       AND expires_at > ?
+
                     """,
-                    (principal_id, instant)
+
+                    (
+                        principal_id,
+
+                        instant
+
+                    )
+
                 ).fetchone()
 
                 if valid is None:
+
                     raise ValueError(
                         "Guest session expired or invalid"
                     )
 
             rows = conn.execute(
                 """
+
                 SELECT occurred_at
+
                 FROM usage_events
+
                 WHERE principal_kind = ?
+
                   AND principal_id = ?
+
                   AND occurred_at > ?
+
                 ORDER BY occurred_at ASC, id ASC
+
                 """,
+
                 (
                     kind,
+
                     principal_id,
+
                     start - 1
+
                 )
+
             ).fetchall()
 
             used = len(rows)
+
             allowed = used < limit
 
             if allowed:
+
                 conn.execute(
                     """
+
                     INSERT INTO usage_events (
+
                         principal_kind,
+
                         principal_id,
+
                         occurred_at
+
                     )
+
                     VALUES (?, ?, ?)
+
                     """,
+
                     (
                         kind,
+
                         principal_id,
+
                         instant
+
                     )
                 )
 
                 used += 1
 
             if kind == "guest":
+
                 reset_at = (
+
                     int(rows[0]["occurred_at"])
                     + DAY_SECONDS
+
                     if rows
+
                     else instant + DAY_SECONDS
+
                 )
+
             else:
+
                 reset_at = start + DAY_SECONDS
 
             conn.execute("COMMIT")
 
             return QuotaResult(
+
                 allowed=allowed,
+
                 limit=limit,
+
                 used=used,
+
                 remaining=max(0, limit - used),
+
                 reset_at=reset_at
+
             )
 
         except Exception:
-            conn.execute("ROLLBACK")
+
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+
             raise
 
         finally:
+
             conn.close()
 
-    # ====================================
+    # ======================================
     # CHECK STATUS WITHOUT CHARGING
-    # ====================================
+    # ======================================
 
     def status(
         self,
@@ -318,10 +464,14 @@ class UsageStore:
         *,
         now=None
     ):
+
         if kind not in ("guest", "member"):
             raise ValueError("Invalid account type")
 
-        if not principal_id:
+        if (
+            not isinstance(principal_id, str)
+            or not principal_id.strip()
+        ):
             raise ValueError("Principal ID required")
 
         instant = (
@@ -331,10 +481,15 @@ class UsageStore:
         )
 
         if kind == "guest":
+
             limit = GUEST_LIMIT
+
             start = instant - DAY_SECONDS
+
         else:
+
             limit = MEMBER_LIMIT
+
             start = (
                 (
                     (instant + DHAKA_OFFSET)
@@ -344,53 +499,94 @@ class UsageStore:
             )
 
         with closing(self._connect()) as conn:
+
             if kind == "guest":
+
                 valid = conn.execute(
                     """
-                    SELECT 1 FROM guest_sessions
+
+                    SELECT 1
+
+                    FROM guest_sessions
+
                     WHERE token_hash = ?
+
                       AND expires_at > ?
+
                     """,
-                    (principal_id, instant)
+
+                    (
+                        principal_id,
+
+                        instant
+
+                    )
+
                 ).fetchone()
 
                 if valid is None:
+
                     raise ValueError(
                         "Guest session expired or invalid"
                     )
 
             rows = conn.execute(
                 """
+
                 SELECT occurred_at
+
                 FROM usage_events
+
                 WHERE principal_kind = ?
+
                   AND principal_id = ?
+
                   AND occurred_at > ?
+
                 ORDER BY occurred_at ASC, id ASC
+
                 """,
+
                 (
                     kind,
+
                     principal_id,
+
                     start - 1
+
                 )
+
             ).fetchall()
 
         used = len(rows)
 
         if kind == "guest":
+
             reset_at = (
+
                 int(rows[0]["occurred_at"])
                 + DAY_SECONDS
+
                 if rows
+
                 else instant + DAY_SECONDS
+
             )
+
         else:
+
             reset_at = start + DAY_SECONDS
 
         return QuotaResult(
+
             allowed=used < limit,
+
             limit=limit,
+
             used=used,
+
             remaining=max(0, limit - used),
+
             reset_at=reset_at
+
         )

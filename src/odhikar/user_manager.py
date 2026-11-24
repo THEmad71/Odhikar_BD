@@ -10,12 +10,12 @@ from src.odhikar.database import DB_PATH
 
 
 # ==========================================
-# 1. USER DATABASE PATH
+# 1. CENTRAL USER DATABASE PATH
 # ==========================================
 
-USER_DB_PATH = Path(DB_PATH).with_name(
-    "odhikar_users.sqlite"
-)
+# All user data now uses the central database.
+
+USER_DB_PATH = Path(DB_PATH)
 
 
 # ==========================================
@@ -31,13 +31,21 @@ def get_connection():
 
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA foreign_keys = ON")
+    # Enable foreign key enforcement.
+    conn.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
+    # Handle concurrent database access.
+    conn.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
 
     return conn
 
 
 # ==========================================
-# 3. INITIALIZE USER DATABASE
+# 3. INITIALIZE USER TABLES
 # ==========================================
 
 def initialize_user_db():
@@ -87,7 +95,7 @@ def initialize_user_db():
             """)
 
 
-# Initialize database
+# Initialize central user tables.
 initialize_user_db()
 
 
@@ -98,12 +106,16 @@ initialize_user_db()
 def create_user(display_name: str) -> dict:
 
     if not isinstance(display_name, str):
-        raise ValueError("Display name must be text.")
+        raise ValueError(
+            "Display name must be text."
+        )
 
     display_name = display_name.strip()
 
     if not display_name:
-        raise ValueError("Display name is required.")
+        raise ValueError(
+            "Display name is required."
+        )
 
     user_id = f"user_{uuid4().hex}"
 
@@ -147,6 +159,11 @@ def get_user(user_id: str):
     if not isinstance(user_id, str):
         return None
 
+    user_id = user_id.strip()
+
+    if not user_id:
+        return None
+
     with closing(get_connection()) as conn:
 
         record = conn.execute("""
@@ -155,7 +172,7 @@ def get_user(user_id: str):
             FROM users
             WHERE user_id = ?
 
-        """, (user_id.strip(),)).fetchone()
+        """, (user_id,)).fetchone()
 
     if record is None:
         return None
@@ -169,12 +186,17 @@ def get_user(user_id: str):
 
 def create_user_thread(user_id: str):
 
+    if not isinstance(user_id, str):
+        raise ValueError("Valid User ID required.")
+
+    user_id = user_id.strip()
+
     user = get_user(user_id)
 
     if user is None:
         raise ValueError("User not found.")
 
-    # Generate a unique conversation ID
+    # Generate unique conversation ID.
     thread_id = f"odhikar_{uuid4().hex}"
 
     created_at = datetime.now(
@@ -213,6 +235,11 @@ def list_user_threads(user_id: str) -> list:
     if not isinstance(user_id, str):
         return []
 
+    user_id = user_id.strip()
+
+    if not user_id:
+        return []
+
     with closing(get_connection()) as conn:
 
         records = conn.execute("""
@@ -222,7 +249,7 @@ def list_user_threads(user_id: str) -> list:
             WHERE user_id = ?
             ORDER BY created_at DESC
 
-        """, (user_id.strip(),)).fetchall()
+        """, (user_id,)).fetchall()
 
     return [
         dict(record)
@@ -245,17 +272,27 @@ def delete_user_thread_record(
     if not isinstance(thread_id, str):
         return False
 
+    user_id = user_id.strip()
+    thread_id = thread_id.strip()
+
+    if not user_id or not thread_id:
+        return False
+
     with closing(get_connection()) as conn:
 
         with conn:
 
             cursor = conn.execute("""
+
                 DELETE FROM user_threads
+
                 WHERE user_id = ?
+
                 AND thread_id = ?
+
             """, (
-                user_id.strip(),
-                thread_id.strip()
+                user_id,
+                thread_id
             ))
 
             return cursor.rowcount > 0

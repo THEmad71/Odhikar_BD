@@ -1,14 +1,92 @@
+
+# ==========================================
+# ODHIKAR BD - LANGGRAPH + LANGSMITH
+# ==========================================
+
+# 0. ORMSGPACK COMPATIBILITY
+
 from src.odhikar.ormsgpack_compat import (
     install as install_ormsgpack_compat
 )
 
 install_ormsgpack_compat()
 
+
+# ==========================================
+# 1. STANDARD IMPORTS
+# ==========================================
+
+import os
 import sqlite3
 import json
 import logging
+import hashlib
 
 from pathlib import Path
+
+
+# ==========================================
+# 2. CONFIGURATION
+# ==========================================
+
+from src.odhikar.config import settings
+
+
+# ==========================================
+# 3. LOGGING
+# ==========================================
+
+logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# 4. LANGSMITH CONFIGURATION
+# ==========================================
+
+LANGSMITH_TRACING_ENABLED = bool(
+    settings.langsmith_tracing
+    and settings.langsmith_api_key
+)
+
+if settings.langsmith_api_key:
+
+    os.environ["LANGSMITH_API_KEY"] = (
+        settings.langsmith_api_key
+    )
+
+os.environ["LANGSMITH_TRACING"] = (
+    "true"
+    if LANGSMITH_TRACING_ENABLED
+    else "false"
+)
+
+os.environ["LANGSMITH_PROJECT"] = (
+    settings.langsmith_project
+)
+
+if settings.langsmith_tracing and not settings.langsmith_api_key:
+
+    logger.warning(
+        "LangSmith tracing requested but API key is missing."
+    )
+
+if LANGSMITH_TRACING_ENABLED:
+
+    logger.info(
+        "LangSmith tracing enabled. Project: %s",
+        settings.langsmith_project
+    )
+
+else:
+
+    logger.info(
+        "LangSmith tracing disabled."
+    )
+
+
+# ==========================================
+# 5. LANGCHAIN IMPORTS
+# ==========================================
 
 from langchain_core.messages import (
     HumanMessage,
@@ -25,20 +103,24 @@ from langgraph.graph import (
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+
+# ==========================================
+# 6. ODHIKAR IMPORTS
+# ==========================================
+
 from src.odhikar.database import DB_PATH
-from src.odhikar.llm import llm_with_tools
-from src.odhikar.langchain_tools import ODHIKAR_TOOLS
+
+from src.odhikar.llm import (
+    llm_with_tools
+)
+
+from src.odhikar.langchain_tools import (
+    ODHIKAR_TOOLS
+)
 
 
 # ==========================================
-# 0. LOGGING
-# ==========================================
-
-logger = logging.getLogger(__name__)
-
-
-# ==========================================
-# 1. SYSTEM PROMPT
+# 7. SYSTEM PROMPT
 # ==========================================
 
 SYSTEM_PROMPT = SystemMessage(
@@ -74,7 +156,7 @@ SYSTEM_PROMPT = SystemMessage(
 
 
 # ==========================================
-# 2. TOOL REGISTRY
+# 8. TOOL REGISTRY
 # ==========================================
 
 TOOL_MAP = {
@@ -84,7 +166,7 @@ TOOL_MAP = {
 
 
 # ==========================================
-# 3. CHATBOT NODE
+# 9. CHATBOT NODE
 # ==========================================
 
 def chatbot(state: MessagesState):
@@ -94,7 +176,32 @@ def chatbot(state: MessagesState):
         *state["messages"]
     ]
 
-    response = llm_with_tools.invoke(messages)
+    logger.info(
+        "Chatbot node started."
+    )
+
+    response = llm_with_tools.invoke(
+        messages,
+        config={
+            "run_name": "odhikar_gemini_call",
+
+            "tags": [
+                "odhikar-bd",
+                "gemini",
+                "legal-assistant"
+            ],
+
+            "metadata": {
+                "application": "odhikar-bd",
+                "environment": settings.app_env,
+                "component": "chatbot"
+            }
+        }
+    )
+
+    logger.info(
+        "Chatbot node completed."
+    )
 
     return {
         "messages": [response]
@@ -102,7 +209,7 @@ def chatbot(state: MessagesState):
 
 
 # ==========================================
-# 4. CUSTOM TOOL EXECUTION NODE
+# 10. CUSTOM TOOL EXECUTION NODE
 # ==========================================
 
 def execute_tools(state: MessagesState):
@@ -110,7 +217,10 @@ def execute_tools(state: MessagesState):
     messages = state["messages"]
 
     if not messages:
-        return {"messages": []}
+
+        return {
+            "messages": []
+        }
 
     last_message = messages[-1]
 
@@ -121,7 +231,10 @@ def execute_tools(state: MessagesState):
     )
 
     if not tool_calls:
-        return {"messages": []}
+
+        return {
+            "messages": []
+        }
 
     tool_messages = []
 
@@ -152,6 +265,11 @@ def execute_tools(state: MessagesState):
 
         if tool is None:
 
+            logger.error(
+                "Unknown tool requested: %s",
+                tool_name
+            )
+
             result_content = json.dumps(
                 {
                     "status": "error",
@@ -164,25 +282,46 @@ def execute_tools(state: MessagesState):
 
             try:
 
-                # Execute Python tool directly
+                # Validate arguments
 
                 if not isinstance(tool_args, dict):
+
                     raise ValueError(
                         "Tool arguments must be a dictionary."
                     )
 
-                result = tool.invoke(tool_args)
+                # Execute tool with tracing metadata
+
+                tool_result = tool.invoke(
+                    tool_args,
+                    config={
+                        "run_name": (
+                            f"odhikar_tool_{tool_name}"
+                        ),
+
+                        "tags": [
+                            "odhikar-bd",
+                            "legal-tool"
+                        ],
+
+                        "metadata": {
+                            "application": "odhikar-bd",
+                            "environment": settings.app_env,
+                            "tool_name": str(tool_name)
+                        }
+                    }
+                )
 
                 # Convert result to readable JSON
 
-                if isinstance(result, str):
+                if isinstance(tool_result, str):
 
-                    result_content = result
+                    result_content = tool_result
 
                 else:
 
                     result_content = json.dumps(
-                        result,
+                        tool_result,
                         ensure_ascii=False,
                         default=str
                     )
@@ -220,7 +359,9 @@ def execute_tools(state: MessagesState):
             name=tool_name or "unknown_tool"
         )
 
-        tool_messages.append(tool_message)
+        tool_messages.append(
+            tool_message
+        )
 
     return {
         "messages": tool_messages
@@ -228,7 +369,7 @@ def execute_tools(state: MessagesState):
 
 
 # ==========================================
-# 5. CUSTOM CONDITIONAL ROUTER
+# 11. CONDITIONAL ROUTER
 # ==========================================
 
 def route_after_chatbot(state: MessagesState):
@@ -236,6 +377,7 @@ def route_after_chatbot(state: MessagesState):
     messages = state["messages"]
 
     if not messages:
+
         return END
 
     last_message = messages[-1]
@@ -246,26 +388,24 @@ def route_after_chatbot(state: MessagesState):
         []
     )
 
-    # If Gemini requests a tool,
-    # route execution to custom tool node.
-
     if tool_calls:
-        return "tools"
 
-    # Otherwise finish the graph.
+        return "tools"
 
     return END
 
 
 # ==========================================
-# 6. CREATE GRAPH BUILDER
+# 12. CREATE GRAPH BUILDER
 # ==========================================
 
-graph_builder = StateGraph(MessagesState)
+graph_builder = StateGraph(
+    MessagesState
+)
 
 
 # ==========================================
-# 7. REGISTER NODES
+# 13. REGISTER NODES
 # ==========================================
 
 graph_builder.add_node(
@@ -280,7 +420,7 @@ graph_builder.add_node(
 
 
 # ==========================================
-# 8. DEFINE GRAPH EDGES
+# 14. DEFINE GRAPH EDGES
 # ==========================================
 
 graph_builder.add_edge(
@@ -300,14 +440,10 @@ graph_builder.add_edge(
 
 
 # ==========================================
-# 9. CHECKPOINT DATABASE PATH
+# 15. CENTRAL CHECKPOINT DATABASE
 # ==========================================
 
-CHECKPOINT_DB_PATH = (
-    Path(DB_PATH).with_name(
-        "odhikar_checkpoints.sqlite"
-    )
-)
+CHECKPOINT_DB_PATH = Path(DB_PATH)
 
 CHECKPOINT_DB_PATH.parent.mkdir(
     parents=True,
@@ -316,7 +452,7 @@ CHECKPOINT_DB_PATH.parent.mkdir(
 
 
 # ==========================================
-# 10. SQLITE CONNECTION
+# 16. SQLITE CONNECTION
 # ==========================================
 
 checkpoint_connection = sqlite3.connect(
@@ -325,20 +461,30 @@ checkpoint_connection = sqlite3.connect(
     timeout=30
 )
 
+checkpoint_connection.execute(
+    "PRAGMA foreign_keys = ON"
+)
+
+checkpoint_connection.execute(
+    "PRAGMA busy_timeout = 30000"
+)
+
 
 # ==========================================
-# 11. INITIALIZE CHECKPOINTER
+# 17. INITIALIZE CHECKPOINTER
 # ==========================================
 
 checkpointer = SqliteSaver(
     checkpoint_connection
 )
 
+# Preserve existing checkpoint data.
+
 checkpointer.setup()
 
 
 # ==========================================
-# 12. COMPILE GRAPH WITH MEMORY
+# 18. COMPILE GRAPH
 # ==========================================
 
 odhikar_graph = graph_builder.compile(
@@ -347,12 +493,13 @@ odhikar_graph = graph_builder.compile(
 
 
 # ==========================================
-# 13. EXTRACT READABLE TEXT
+# 19. EXTRACT READABLE TEXT
 # ==========================================
 
 def extract_text(content):
 
     if isinstance(content, str):
+
         return content
 
     if isinstance(content, list):
@@ -371,7 +518,9 @@ def extract_text(content):
 
             elif hasattr(block, "text"):
 
-                answer.append(block.text)
+                answer.append(
+                    block.text
+                )
 
         return "\n".join(answer).strip()
 
@@ -379,7 +528,7 @@ def extract_text(content):
 
 
 # ==========================================
-# 14. MAIN ODHIKAR GRAPH FUNCTION
+# 20. MAIN ODHIKAR GRAPH FUNCTION
 # ==========================================
 
 def ask_odhikar_graph(
@@ -395,38 +544,109 @@ def ask_odhikar_graph(
 
         return "A valid thread ID is required."
 
+    clean_thread_id = thread_id.strip()
+
+    # Create a non-reversible trace identifier.
+    # Do not expose the original session/thread ID
+    # as custom LangSmith metadata.
+
+    thread_hash = hashlib.sha256(
+        clean_thread_id.encode("utf-8")
+    ).hexdigest()[:20]
+
+    # LangGraph invocation configuration
+
     config = {
-        "configurable": {
-            "thread_id": thread_id.strip()
+
+        "run_name": "odhikar_bd_request",
+
+        "tags": [
+            "odhikar-bd",
+            "legal-assistant",
+            settings.app_env
+        ],
+
+        "metadata": {
+
+            "application": "odhikar-bd",
+
+            "environment": settings.app_env,
+
+            "thread_id": thread_hash,
+
+            "thread_id_hash": thread_hash
         },
+
+        "configurable": {
+
+            "thread_id": clean_thread_id
+        },
+
         "recursion_limit": 20
     }
 
-    result = odhikar_graph.invoke(
-        {
-            "messages": [
-                HumanMessage(
-                    content=query.strip()
-                )
-            ]
-        },
-        config=config
+    logger.info(
+        "Starting Odhikar BD graph execution."
     )
 
-    final_message = result["messages"][-1]
+    try:
 
-    return extract_text(
-        final_message.content
-    )
+        result = odhikar_graph.invoke(
+            {
+                "messages": [
+                    HumanMessage(
+                        content=query.strip()
+                    )
+                ]
+            },
+            config=config
+        )
+
+        messages = result.get(
+            "messages",
+            []
+        )
+
+        if not messages:
+
+            logger.warning(
+                "Graph returned no messages."
+            )
+
+            return (
+                "Sorry, I could not generate a response. "
+                "Please try again."
+            )
+
+        final_message = messages[-1]
+
+        answer = extract_text(
+            final_message.content
+        )
+
+        logger.info(
+            "Odhikar BD graph execution completed."
+        )
+
+        return answer
+
+    except Exception:
+
+        logger.exception(
+            "Odhikar BD graph execution failed."
+        )
+
+        raise
 
 
 # ==========================================
-# 15. GRAPH INFORMATION
+# 21. GRAPH INFORMATION
 # ==========================================
 
 def get_graph_info():
 
     return {
+
         "graph_name": "Odhikar BD LangGraph",
 
         "nodes": [
@@ -442,28 +662,44 @@ def get_graph_info():
             CHECKPOINT_DB_PATH
         ),
 
-        "memory_enabled": True
+        "memory_enabled": True,
+
+        "langsmith_tracing_enabled": (
+            LANGSMITH_TRACING_ENABLED
+        ),
+
+        "langsmith_project": (
+            settings.langsmith_project
+            if LANGSMITH_TRACING_ENABLED
+            else None
+        )
     }
 
 
 # ==========================================
-# 16. GET CONVERSATION HISTORY
+# 22. GET CONVERSATION HISTORY
 # ==========================================
 
 def get_conversation_history(thread_id: str):
 
     if not isinstance(thread_id, str) or not thread_id.strip():
+
         return []
 
     config = {
+
         "configurable": {
+
             "thread_id": thread_id.strip()
         }
     }
 
-    snapshot = odhikar_graph.get_state(config)
+    snapshot = odhikar_graph.get_state(
+        config
+    )
 
     if not snapshot or not snapshot.values:
+
         return []
 
     return snapshot.values.get(

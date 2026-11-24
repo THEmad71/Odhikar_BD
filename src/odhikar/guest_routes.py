@@ -9,10 +9,8 @@ Features:
 - Guest conversation history
 - LangGraph / Gemini integration
 - Five messages per rolling 24 hours
+- Centralized SQLite database
 - Proper SQLite connection cleanup
-
-Compatible with the existing UsageStore
-and FastAPI application.
 """
 
 import hmac
@@ -95,13 +93,38 @@ def build_guest_router(
     guest_csrf_cookie = "odhikar_guest_csrf"
 
     # ======================================
-    # 3. INITIALIZE GUEST THREAD TABLE
+    # 3. CENTRAL DATABASE CONNECTION
+    # ======================================
+
+    def guest_db_connection():
+
+        conn = sqlite3.connect(
+            str(store.db_path),
+            timeout=30,
+        )
+
+        conn.row_factory = sqlite3.Row
+
+        # Enable foreign key enforcement.
+        conn.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        # Handle concurrent database access.
+        conn.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
+
+        return conn
+
+    # ======================================
+    # 4. INITIALIZE GUEST THREAD TABLE
     # ======================================
 
     def initialize_guest_tables():
 
         with closing(
-            sqlite3.connect(store.db_path)
+            guest_db_connection()
         ) as conn:
 
             with conn:
@@ -137,7 +160,7 @@ def build_guest_router(
     initialize_guest_tables()
 
     # ======================================
-    # 4. VERIFY GUEST SESSION
+    # 5. VERIFY GUEST SESSION
     # ======================================
 
     def guest_context(
@@ -168,7 +191,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 5. GUEST CSRF VALIDATION
+    # 6. GUEST CSRF VALIDATION
     # ======================================
 
     def guest_csrf(
@@ -221,7 +244,7 @@ def build_guest_router(
         return context
 
     # ======================================
-    # 6. CHECK THREAD OWNERSHIP
+    # 7. CHECK THREAD OWNERSHIP
     # ======================================
 
     def owns_thread(
@@ -229,9 +252,8 @@ def build_guest_router(
         thread_id: str,
     ) -> bool:
 
-        # Explicitly close SQLite connection.
         with closing(
-            sqlite3.connect(store.db_path)
+            guest_db_connection()
         ) as conn:
 
             row = conn.execute(
@@ -253,7 +275,7 @@ def build_guest_router(
         return row is not None
 
     # ======================================
-    # 7. REQUIRE THREAD OWNERSHIP
+    # 8. REQUIRE THREAD OWNERSHIP
     # ======================================
 
     def require_owned_thread(
@@ -272,7 +294,7 @@ def build_guest_router(
             )
 
     # ======================================
-    # 8. CREATE OR REUSE GUEST SESSION
+    # 9. CREATE OR REUSE GUEST SESSION
     # ======================================
 
     @router.post(
@@ -343,7 +365,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 9. GET GUEST CSRF TOKEN
+    # 10. GET GUEST CSRF TOKEN
     # ======================================
 
     @router.get("/csrf-token")
@@ -373,7 +395,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 10. CREATE GUEST CONVERSATION
+    # 11. CREATE GUEST CONVERSATION
     # ======================================
 
     @router.post(
@@ -394,7 +416,7 @@ def build_guest_router(
         created_at = int(time.time())
 
         with closing(
-            sqlite3.connect(store.db_path)
+            guest_db_connection()
         ) as conn:
 
             with conn:
@@ -424,7 +446,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 11. LIST GUEST CONVERSATIONS
+    # 12. LIST GUEST CONVERSATIONS
     # ======================================
 
     @router.get("/threads")
@@ -435,10 +457,8 @@ def build_guest_router(
     ):
 
         with closing(
-            sqlite3.connect(store.db_path)
+            guest_db_connection()
         ) as conn:
-
-            conn.row_factory = sqlite3.Row
 
             rows = conn.execute(
                 """
@@ -472,7 +492,7 @@ def build_guest_router(
         return result
 
     # ======================================
-    # 12. GUEST CONVERSATION HISTORY
+    # 13. GUEST CONVERSATION HISTORY
     # ======================================
 
     @router.get(
@@ -504,7 +524,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 13. REAL GUEST AI CHAT
+    # 14. REAL GUEST AI CHAT
     # ======================================
 
     @router.post("/chat")

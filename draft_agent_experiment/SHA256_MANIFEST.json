@@ -1,0 +1,9 @@
+{
+  "README_START_HERE.md": "3fd5df05fb07cf74626ed72399490b6bf8b2709ccf73db260bac0c4c757f6916",
+  "reports/release_gate.json": "84167996187cdd6535d0519926dbb28c12fa42dd82e4538f3ff39925563448d6",
+  "tests/test_draft_agent.py": "b35d6c037b46397a31a0666904ee01f7bbdd9e84cc6c05a956019a17f2a7e046",
+  "rag_data/chunks_DRAFT.jsonl": "0e0199bbb091773a7712ac1ecb85dbc1b59054c85cd43e59db14c8599a62613b",
+  "scripts/hybrid_retriever.py": "75c600d153937e688ed48ef9878baf1aa36af964832a555e31bdf94ff94093ee",
+  "scripts/banglish_retriever.py": "e8743a624f0d45b84f732adc6ae2b73e310b5ec83cc128f091eeaf67c7aaf9ff",
+  "scripts/draft_agent.py": "c4ba114207e246478f2cec526e5993c1d1db09558c5d891a3ca47553adec9716"
+}

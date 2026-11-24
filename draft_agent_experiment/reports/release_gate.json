@@ -1,0 +1,25 @@
+{
+  "release_status": "BLOCKED_NOT_PRODUCTION_RAG_READY",
+  "basis": "Batch11 targeted source-corrected OCR, not full-passage certified",
+  "source_pages": 47,
+  "sections_found": 126,
+  "chunks_created": 138,
+  "audit_review_records": 135,
+  "audit_outcomes": {
+    "english_terms_present_in_source": 30,
+    "requires_visual_source_review": 84,
+    "targeted_source_verified_correction": 21
+  },
+  "unresolved_review_count": 84,
+  "partial_latin_matches_not_full_verification": 30,
+  "production_approved_chunks": 0,
+  "required_before_release": [
+    "Resolve outstanding source review and certify all relevant full passages",
+    "Compare all penalties / imprisonment with Gazette and current authoritative law",
+    "Check subsequent amendment and effective-date history",
+    "Validate every chunk page/section alignment and cross-page completeness",
+    "Build and test production embedding + BM25 indexes",
+    "Run cited-answer faithfulness, abstention and regression evaluations",
+    "Security and production integration tests"
+  ]
+}
