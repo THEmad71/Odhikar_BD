@@ -1,22 +1,67 @@
 
+import os
 import sqlite3
+
 from pathlib import Path
+from dotenv import load_dotenv
 
 
-# Find project root
+# ==========================================
+# 1. LOAD ENVIRONMENT VARIABLES
+# ==========================================
+
+load_dotenv()
+
+
+# ==========================================
+# 2. PROJECT ROOT
+# ==========================================
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Database file location
-DB_PATH = PROJECT_ROOT / "data" / "processed" / "odhikar.db"
 
+# ==========================================
+# 3. CENTRAL DATABASE PATH
+# ==========================================
+
+DEFAULT_DB_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "odhikar.db"
+)
+
+configured_path = os.getenv("ODHIKAR_DB_PATH")
+
+DB_PATH = Path(
+    configured_path
+).expanduser() if configured_path else DEFAULT_DB_PATH
+
+if not DB_PATH.is_absolute():
+    DB_PATH = PROJECT_ROOT / DB_PATH
+
+DB_PATH = DB_PATH.resolve()
+
+
+# ==========================================
+# 4. DATABASE INITIALIZATION
+# ==========================================
 
 def init_db():
 
-    # Create database directory
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    # Connect to database
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(
+        DB_PATH,
+        timeout=30
+    ) as conn:
+
+        conn.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS offences (
@@ -36,8 +81,14 @@ def init_db():
             )
         """)
 
-    print("Database created successfully!")
+        conn.commit()
 
+    print("Database initialized:", DB_PATH)
+
+
+# ==========================================
+# 5. DIRECT EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
     init_db()

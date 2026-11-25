@@ -47,6 +47,7 @@ from pydantic import (
 )
 
 from src.odhikar.config import settings
+from src.odhikar.database import init_db
 
 from src.odhikar.auth_manager import register_user
 
@@ -545,6 +546,25 @@ app = FastAPI(
     ),
     version="2.1.0",
 )
+
+
+# ==========================================
+# 12A. DATABASE INITIALIZATION
+# ==========================================
+
+@app.on_event("startup")
+def initialize_application_database():
+    """
+    Ensure the central offences table exists before
+    the API starts serving requests.
+
+    CREATE TABLE IF NOT EXISTS preserves existing data.
+    This does not populate or overwrite offence records.
+    """
+    init_db()
+    logger.info("Odhikar BD central database initialized.")
+
+
 
 
 # ==========================================

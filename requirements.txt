@@ -1,7 +1,32 @@
-# Odhikar BD - Python dependencies
 
-pydantic
-pydantic-settings
-python-dotenv
-google-genai
-langchain-google-genai
+# ==========================================
+# ODHIKAR BD - PRODUCTION REQUIREMENTS
+# ==========================================
+
+# FastAPI Backend
+fastapi==0.165.0
+uvicorn==0.54.0
+
+# Configuration and Validation
+pydantic==2.14.3
+pydantic-settings==2.16.3
+python-dotenv==1.2.4
+
+# Google Gemini
+google-genai==3.3.0
+langchain-google-genai==4.5.0
+
+# LangChain and LangGraph
+langchain-core==1.8.1
+langgraph==1.2.22
+
+# SQLite Checkpoint
+langgraph-checkpoint-sqlite==3.1.3
+aiosqlite==0.22.1
+sqlite-vec==0.1.9
+
+# LangSmith Monitoring
+langsmith==0.14.17
+
+# MessagePack Compatibility
+msgpack==1.2.4
