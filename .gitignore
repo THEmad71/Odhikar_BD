@@ -195,3 +195,7 @@ service-account*.json
 
 # Suspicious temporary root file
 /1
+
+.env
+.env.*
+!.env.example

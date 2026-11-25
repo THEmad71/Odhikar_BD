@@ -30,3 +30,9 @@ langsmith==0.14.17
 
 # MessagePack Compatibility
 msgpack==1.2.4
+# ==========================================
+# NEON POSTGRESQL + LANGGRAPH CHECKPOINTING
+# ==========================================
+
+psycopg[binary,pool]==3.3.9
+langgraph-checkpoint-postgres==3.2.1

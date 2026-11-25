@@ -1,24 +1,37 @@
 
 """
-Odhikar BD - Secure Guest API Routes
+ODHIKAR BD
+Secure Guest API Routes
+
+Primary database:
+    Neon PostgreSQL
+
+Connection:
+    Central Psycopg 3 ConnectionPool
 
 Features:
-- Anonymous guest sessions
-- Guest CSRF protection
-- Guest conversation ownership
-- Guest conversation history
-- LangGraph / Gemini integration
-- Five messages per rolling 24 hours
-- Centralized SQLite database
-- Proper SQLite connection cleanup
+    - Anonymous guest sessions
+    - Guest CSRF protection
+    - Guest conversation ownership
+    - Guest conversation history
+    - LangGraph / Gemini integration
+    - Five messages per rolling 24 hours
+    - PostgreSQL connection pooling
+    - Existing guest data preservation
+
+No direct SQLite dependency.
+No automatic table creation or recreation.
 """
 
+# ==========================================
+# 1. IMPORTS
+# ==========================================
+
 import hmac
+import logging
 import secrets
-import sqlite3
 import time
 
-from contextlib import closing
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -26,15 +39,14 @@ from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
+    Path,
     Request,
     Response,
 )
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-)
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.odhikar.database import get_db_connection
 
 from src.odhikar.graph import (
     ask_odhikar_graph,
@@ -42,21 +54,27 @@ from src.odhikar.graph import (
 )
 
 from src.odhikar.usage_limits import (
-    UsageStore,
-    GUEST_COOKIE,
     DAY_SECONDS,
+    GUEST_COOKIE,
     GUEST_LIMIT,
+    UsageStore,
 )
 
 
+logger = logging.getLogger(__name__)
+
+GUEST_CSRF_COOKIE = "odhikar_guest_csrf"
+
+
 # ==========================================
-# 1. REQUEST MODELS
+# 2. REQUEST MODELS
 # ==========================================
 
 class GuestChatRequest(BaseModel):
 
     model_config = ConfigDict(
-        extra="forbid"
+        extra="forbid",
+        str_strip_whitespace=True,
     )
 
     thread_id: str = Field(
@@ -71,7 +89,108 @@ class GuestChatRequest(BaseModel):
 
 
 # ==========================================
-# 2. BUILD GUEST ROUTER
+# 3. POSTGRESQL SCHEMA REQUIREMENTS
+# ==========================================
+
+REQUIRED_GUEST_SCHEMA = {
+
+    "guest_sessions": {
+        "token_hash",
+        "created_at",
+        "expires_at",
+    },
+
+    "guest_threads": {
+        "thread_id",
+        "guest_hash",
+        "created_at",
+    },
+
+    "usage_events": {
+        "id",
+        "principal_kind",
+        "principal_id",
+        "occurred_at",
+    },
+
+}
+
+
+def verify_guest_schema() -> None:
+
+    """
+    Verify existing PostgreSQL tables.
+
+    This function is read-only.
+
+    It does not:
+        - Create tables
+        - Alter tables
+        - Delete records
+        - Overwrite existing data
+
+    Psycopg uses dict_row, so rows are accessed
+    through their column names.
+    """
+
+    missing_by_table = {}
+
+    with get_db_connection() as conn:
+
+        for table_name, required_columns in (
+            REQUIRED_GUEST_SCHEMA.items()
+        ):
+
+            rows = conn.execute(
+                """
+                SELECT column_name
+
+                FROM information_schema.columns
+
+                WHERE table_schema = 'public'
+
+                AND table_name = %s
+
+                """,
+                (table_name,),
+            ).fetchall()
+
+            existing_columns = {
+                row["column_name"]
+                for row in rows
+            }
+
+            missing_columns = (
+                required_columns - existing_columns
+            )
+
+            if missing_columns:
+
+                missing_by_table[table_name] = sorted(
+                    missing_columns
+                )
+
+    if missing_by_table:
+
+        details = "; ".join(
+            f"{table}: {', '.join(columns)}"
+            for table, columns in (
+                missing_by_table.items()
+            )
+        )
+
+        raise RuntimeError(
+            "Guest PostgreSQL schema verification failed. "
+            f"Missing columns: {details}"
+        )
+
+    logger.info(
+        "Guest PostgreSQL schema verified successfully."
+    )
+
+
+# ==========================================
+# 4. BUILD GUEST ROUTER
 # ==========================================
 
 def build_guest_router(
@@ -83,93 +202,53 @@ def build_guest_router(
     *,
     cookie_secure: bool,
     cookie_samesite: str = "lax",
-):
+) -> APIRouter:
 
     router = APIRouter(
         prefix="/guest",
         tags=["Guest Access"],
     )
 
-    guest_csrf_cookie = "odhikar_guest_csrf"
-
     # ======================================
-    # 3. CENTRAL DATABASE CONNECTION
+    # 5. STARTUP SCHEMA VERIFICATION
     # ======================================
 
-    def guest_db_connection():
+    # Verify the database during application startup.
+    # Do not connect to PostgreSQL during module import.
 
-        conn = sqlite3.connect(
-            str(store.db_path),
-            timeout=30,
-        )
-
-        conn.row_factory = sqlite3.Row
-
-        # Enable foreign key enforcement.
-        conn.execute(
-            "PRAGMA foreign_keys = ON"
-        )
-
-        # Handle concurrent database access.
-        conn.execute(
-            "PRAGMA busy_timeout = 30000"
-        )
-
-        return conn
+    router.add_event_handler(
+        "startup",
+        verify_guest_schema,
+    )
 
     # ======================================
-    # 4. INITIALIZE GUEST THREAD TABLE
-    # ======================================
-
-    def initialize_guest_tables():
-
-        with closing(
-            guest_db_connection()
-        ) as conn:
-
-            with conn:
-
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    guest_threads (
-
-                        thread_id TEXT PRIMARY KEY,
-
-                        guest_hash TEXT NOT NULL,
-
-                        created_at INTEGER NOT NULL,
-
-                        FOREIGN KEY (guest_hash)
-                        REFERENCES guest_sessions(token_hash)
-                    )
-                    """
-                )
-
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS
-                    idx_guest_threads_owner
-
-                    ON guest_threads (
-                        guest_hash
-                    )
-                    """
-                )
-
-    initialize_guest_tables()
-
-    # ======================================
-    # 5. VERIFY GUEST SESSION
+    # 6. VERIFY GUEST SESSION
     # ======================================
 
     def guest_context(
         request: Request,
     ) -> dict:
 
+        """
+        Validate the guest cookie and resolve
+        its database identity.
+        """
+
+        validate_origin(request)
+
         token = request.cookies.get(
             GUEST_COOKIE
         )
+
+        if not token:
+
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Guest session is missing. "
+                    "Start a new guest session."
+                ),
+            )
 
         guest_hash = store.guest_principal(
             token
@@ -180,7 +259,7 @@ def build_guest_router(
             raise HTTPException(
                 status_code=401,
                 detail=(
-                    "Guest session expired or missing. "
+                    "Guest session expired or is invalid. "
                     "Start a new guest session."
                 ),
             )
@@ -191,7 +270,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 6. GUEST CSRF VALIDATION
+    # 7. GUEST CSRF VALIDATION
     # ======================================
 
     def guest_csrf(
@@ -201,20 +280,20 @@ def build_guest_router(
         ),
     ) -> dict:
 
-        validate_origin(request)
+        """
+        Require matching CSRF cookie/header
+        and a valid token signature.
+        """
 
         csrf_cookie = request.cookies.get(
-            guest_csrf_cookie
+            GUEST_CSRF_COOKIE
         )
 
         csrf_header = request.headers.get(
             "X-CSRF-Token"
         )
 
-        if (
-            not csrf_cookie
-            or not csrf_header
-        ):
+        if not csrf_cookie or not csrf_header:
 
             raise HTTPException(
                 status_code=403,
@@ -244,7 +323,7 @@ def build_guest_router(
         return context
 
     # ======================================
-    # 7. CHECK THREAD OWNERSHIP
+    # 8. CHECK THREAD OWNERSHIP
     # ======================================
 
     def owns_thread(
@@ -252,19 +331,25 @@ def build_guest_router(
         thread_id: str,
     ) -> bool:
 
-        with closing(
-            guest_db_connection()
-        ) as conn:
+        """
+        Confirm that a conversation belongs
+        to the current guest.
+        """
+
+        with get_db_connection() as conn:
 
             row = conn.execute(
                 """
                 SELECT 1
+
                 FROM guest_threads
 
-                WHERE guest_hash = ?
-                AND thread_id = ?
+                WHERE guest_hash = %s
+
+                AND thread_id = %s
 
                 LIMIT 1
+
                 """,
                 (
                     guest_hash,
@@ -275,17 +360,32 @@ def build_guest_router(
         return row is not None
 
     # ======================================
-    # 8. REQUIRE THREAD OWNERSHIP
+    # 9. REQUIRE THREAD OWNERSHIP
     # ======================================
 
     def require_owned_thread(
         guest_hash: str,
         thread_id: str,
-    ):
+    ) -> None:
 
-        if not owns_thread(
-            guest_hash,
-            thread_id,
+        """
+        Prevent guests from accessing
+        another guest's conversations.
+        """
+
+        clean_thread_id = (
+            thread_id.strip()
+            if isinstance(thread_id, str)
+            else ""
+        )
+
+        if (
+            not clean_thread_id
+            or len(clean_thread_id) > 256
+            or not owns_thread(
+                guest_hash,
+                clean_thread_id,
+            )
         ):
 
             raise HTTPException(
@@ -294,17 +394,19 @@ def build_guest_router(
             )
 
     # ======================================
-    # 9. CREATE OR REUSE GUEST SESSION
+    # 10. CREATE OR REUSE GUEST SESSION
     # ======================================
 
-    @router.post(
-        "/session",
-        status_code=201,
-    )
+    @router.post("/session")
     def create_guest_session(
         request: Request,
         response: Response,
     ):
+
+        """
+        Reuse an existing valid guest session
+        or create a new anonymous session.
+        """
 
         validate_origin(request)
 
@@ -316,7 +418,8 @@ def build_guest_router(
             existing_token
         )
 
-        # Reuse the valid existing session.
+        # Reuse a valid existing session.
+
         if principal is not None:
 
             quota = store.status(
@@ -324,17 +427,21 @@ def build_guest_router(
                 principal,
             )
 
+            response.status_code = 200
+
             return {
                 "mode": "guest",
                 "message": (
                     "Guest session already active."
                 ),
                 "limit": quota.limit,
+                "used": quota.used,
                 "remaining": quota.remaining,
                 "reset_at": quota.reset_at,
             }
 
-        # Create a new anonymous identity.
+        # Create a new anonymous session.
+
         token = store.create_guest()
 
         response.set_cookie(
@@ -347,41 +454,50 @@ def build_guest_router(
             path="/",
         )
 
-        # Remove CSRF token associated with
-        # any previous guest identity.
+        # A new session needs a fresh CSRF token.
+
         response.delete_cookie(
-            key=guest_csrf_cookie,
+            key=GUEST_CSRF_COOKIE,
             httponly=False,
             secure=cookie_secure,
             samesite=cookie_samesite,
             path="/",
         )
 
+        response.status_code = 201
+
         return {
             "mode": "guest",
             "message": "Guest session created.",
             "limit": GUEST_LIMIT,
+            "used": 0,
             "remaining": GUEST_LIMIT,
         }
 
     # ======================================
-    # 10. GET GUEST CSRF TOKEN
+    # 11. GET GUEST CSRF TOKEN
     # ======================================
 
     @router.get("/csrf-token")
     def get_guest_csrf(
+        request: Request,
         response: Response,
         context: dict = Depends(
             guest_context
         ),
     ):
 
+        """
+        Issue a CSRF token for the current
+        guest session.
+        """
+
         csrf_token = generate_csrf(
             context["token"]
         )
 
         response.set_cookie(
-            key=guest_csrf_cookie,
+            key=GUEST_CSRF_COOKIE,
             value=csrf_token,
             httponly=False,
             secure=cookie_secure,
@@ -390,12 +506,14 @@ def build_guest_router(
             path="/",
         )
 
+        response.headers["Cache-Control"] = "no-store"
+
         return {
             "csrf_token": csrf_token,
         }
 
     # ======================================
-    # 11. CREATE GUEST CONVERSATION
+    # 12. CREATE GUEST CONVERSATION
     # ======================================
 
     @router.post(
@@ -408,35 +526,43 @@ def build_guest_router(
         ),
     ):
 
+        """
+        Create a conversation owned
+        by the current guest identity.
+        """
+
         thread_id = (
             "guest:"
             + secrets.token_urlsafe(24)
         )
 
-        created_at = int(time.time())
+        created_at = int(
+            time.time()
+        )
 
-        with closing(
-            guest_db_connection()
-        ) as conn:
+        with get_db_connection() as conn:
 
-            with conn:
+            conn.execute(
+                """
+                INSERT INTO guest_threads (
 
-                conn.execute(
-                    """
-                    INSERT INTO guest_threads (
-                        thread_id,
-                        guest_hash,
-                        created_at
-                    )
+                    thread_id,
 
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        thread_id,
-                        context["guest_hash"],
-                        created_at,
-                    ),
+                    guest_hash,
+
+                    created_at
+
                 )
+
+                VALUES (%s, %s, %s)
+
+                """,
+                (
+                    thread_id,
+                    context["guest_hash"],
+                    created_at,
+                ),
+            )
 
         return {
             "thread_id": thread_id,
@@ -446,7 +572,7 @@ def build_guest_router(
         }
 
     # ======================================
-    # 12. LIST GUEST CONVERSATIONS
+    # 13. LIST GUEST CONVERSATIONS
     # ======================================
 
     @router.get("/threads")
@@ -456,19 +582,27 @@ def build_guest_router(
         ),
     ):
 
-        with closing(
-            guest_db_connection()
-        ) as conn:
+        """
+        Return only conversations belonging
+        to the current guest.
+        """
+
+        with get_db_connection() as conn:
 
             rows = conn.execute(
                 """
-                SELECT thread_id, created_at
+                SELECT
+
+                    thread_id,
+
+                    created_at
 
                 FROM guest_threads
 
-                WHERE guest_hash = ?
+                WHERE guest_hash = %s
 
                 ORDER BY created_at DESC
+
                 """,
                 (
                     context["guest_hash"],
@@ -480,51 +614,80 @@ def build_guest_router(
         for row in rows:
 
             created_at = datetime.fromtimestamp(
-                row["created_at"],
+                int(row["created_at"]),
                 tz=timezone.utc,
             ).isoformat()
 
             result.append({
+
                 "thread_id": row["thread_id"],
+
                 "created_at": created_at,
+
             })
 
         return result
 
     # ======================================
-    # 13. GUEST CONVERSATION HISTORY
+    # 14. GUEST CONVERSATION HISTORY
     # ======================================
 
     @router.get(
         "/threads/{thread_id}/messages"
     )
     def guest_history(
-        thread_id: str,
+        thread_id: str = Path(
+            min_length=1,
+            max_length=256,
+        ),
         context: dict = Depends(
             guest_context
         ),
     ):
 
-        # Never read a conversation without
-        # verifying its guest ownership.
+        """
+        Return readable messages after
+        verifying conversation ownership.
+        """
+
+        thread_id = thread_id.strip()
+
         require_owned_thread(
             context["guest_hash"],
             thread_id,
         )
 
-        messages = get_conversation_history(
-            thread_id
-        )
+        try:
+
+            messages = get_conversation_history(
+                thread_id
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "Could not load guest conversation history."
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Conversation history is temporarily unavailable."
+                ),
+            ) from error
 
         return {
+
             "thread_id": thread_id,
+
             "messages": serialize_history(
                 messages
             ),
+
         }
 
     # ======================================
-    # 14. REAL GUEST AI CHAT
+    # 15. GUEST AI CHAT
     # ======================================
 
     @router.post("/chat")
@@ -535,7 +698,13 @@ def build_guest_router(
         ),
     ):
 
+        """
+        Send a message to the existing
+        LangGraph/Gemini assistant.
+        """
+
         thread_id = payload.thread_id.strip()
+
         message = payload.message.strip()
 
         if not thread_id or not message:
@@ -543,24 +712,27 @@ def build_guest_router(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Thread ID and message required."
+                    "Thread ID and message are required."
                 ),
             )
 
-        # Verify thread ownership before
-        # consuming the guest's quota.
+        # Verify ownership before consuming quota.
+
         require_owned_thread(
             context["guest_hash"],
             thread_id,
         )
+
+        # Atomically consume one message
+        # from the rolling 24-hour quota.
 
         quota = store.check_and_consume(
             kind="guest",
             principal_id=context["guest_hash"],
         )
 
-        # Reject sixth message in the
-        # rolling 24-hour window.
+        # Reject requests exceeding the limit.
+
         if not quota.allowed:
 
             retry_after = max(
@@ -570,39 +742,126 @@ def build_guest_router(
 
             raise HTTPException(
                 status_code=429,
+
                 detail={
+
                     "code": "GUEST_LIMIT_REACHED",
+
                     "message": (
                         "Your 5 free guest messages "
                         "have been used. "
                         "Sign in to continue."
                     ),
+
                     "limit": quota.limit,
+
                     "remaining": quota.remaining,
+
                     "reset_at": quota.reset_at,
+
                 },
+
                 headers={
-                    "Retry-After": str(
-                        retry_after
-                    )
+                    "Retry-After": str(retry_after),
                 },
             )
 
-        # Call existing LangGraph + Gemini.
-        # Each guest thread uses an isolated ID.
-        answer = ask_odhikar_graph(
-            message,
-            thread_id=thread_id,
-        )
+        # Call the existing LangGraph + Gemini pipeline.
+
+        try:
+
+            answer = ask_odhikar_graph(
+                message,
+                thread_id=thread_id,
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "Guest LangGraph request failed."
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "The assistant is temporarily unavailable. "
+                    "Please try again later."
+                ),
+            ) from error
+
+        if not isinstance(answer, str) or not answer.strip():
+
+            logger.error(
+                "Guest LangGraph request returned an empty response."
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "The assistant could not generate a response. "
+                    "Please try again later."
+                ),
+            )
 
         return {
+
             "thread_id": thread_id,
+
             "answer": answer,
+
             "usage": {
+
                 "limit": quota.limit,
+
+                "used": quota.used,
+
                 "remaining": quota.remaining,
+
                 "reset_at": quota.reset_at,
+
             },
+
         }
 
+    # ======================================
+    # 16. RETURN ROUTER
+    # ======================================
+
     return router
+
+
+# ==========================================
+# 17. MODULE INFORMATION
+# ==========================================
+
+def get_guest_routes_info() -> dict:
+
+    return {
+
+        "module": "Odhikar BD Guest Routes",
+
+        "database": "Neon PostgreSQL",
+
+        "driver": "Psycopg 3",
+
+        "connection_pool": True,
+
+        "guest_sessions": True,
+
+        "guest_conversations": True,
+
+        "conversation_ownership": True,
+
+        "csrf_protection": True,
+
+        "rolling_24_hour_quota": True,
+
+        "guest_message_limit": GUEST_LIMIT,
+
+        "langgraph_integration": True,
+
+        "legacy_sqlite": False,
+
+        "automatic_schema_creation": False,
+
+    }

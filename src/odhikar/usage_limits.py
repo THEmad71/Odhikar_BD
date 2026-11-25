@@ -1,31 +1,46 @@
 
-"""Odhikar BD: guest identity and atomic message quotas.
-
-Guest: 5 accepted messages in a rolling 24-hour window.
-Member: 30 accepted messages per Bangladesh calendar day.
-
-This module stores no plaintext guest tokens,
-passwords or conversation contents.
 """
+ODHIKAR BD
+PostgreSQL Guest Identity and Atomic Usage Limits
+
+Primary database:
+    Neon PostgreSQL
+
+Driver:
+    Psycopg 3
+
+Connection management:
+    Central PostgreSQL ConnectionPool
+
+Guest:
+    5 accepted messages in a rolling 24-hour window.
+
+Member:
+    30 accepted messages per Bangladesh calendar day.
+
+Security:
+    SHA-256 guest token hashing.
+    No plaintext guest tokens in database.
+    Atomic quota enforcement.
+    PostgreSQL transaction-level advisory locks.
+
+Existing application data is preserved.
+No SQLite fallback is permitted.
+"""
+
+# ==========================================
+# 1. IMPORTS
+# ==========================================
 
 import hashlib
 import secrets
-import sqlite3
 import time
 
-from contextlib import closing
 from dataclasses import dataclass
-from pathlib import Path
 
-from src.odhikar.database import DB_PATH
-
-
-# ==========================================
-# 1. CENTRAL DATABASE CONFIGURATION
-# ==========================================
-
-# All application modules use the same SQLite database.
-DEFAULT_DB = DB_PATH
+from src.odhikar.database import (
+    get_db_connection
+)
 
 
 # ==========================================
@@ -33,9 +48,11 @@ DEFAULT_DB = DB_PATH
 # ==========================================
 
 GUEST_LIMIT = 5
+
 MEMBER_LIMIT = 30
 
 DAY_SECONDS = 86_400
+
 DHAKA_OFFSET = 6 * 3_600
 
 GUEST_COOKIE = "odhikar_guest"
@@ -49,143 +66,349 @@ GUEST_COOKIE = "odhikar_guest"
 class QuotaResult:
 
     allowed: bool
+
     limit: int
+
     used: int
+
     remaining: int
+
     reset_at: int
 
 
 # ==========================================
-# 4. USAGE STORE
+# 4. DATABASE ROW COMPATIBILITY
+# ==========================================
+
+def _row_value(row, key, index):
+    """
+    Support both Psycopg tuple rows
+    and dictionary-style rows.
+    """
+
+    if row is None:
+        raise ValueError("Database returned no row.")
+
+    try:
+        return row[key]
+
+    except (TypeError, KeyError, IndexError):
+
+        return row[index]
+
+
+# ==========================================
+# 5. USAGE STORE
 # ==========================================
 
 class UsageStore:
 
-    def __init__(self, db_path=DEFAULT_DB):
+    def __init__(self, db_path=None):
+        """
+        Initialize PostgreSQL usage storage.
 
-        self.db_path = Path(db_path)
+        SQLite database paths are no longer supported.
+        """
 
-        self.db_path.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
+        if db_path is not None:
+
+            raise ValueError(
+                "SQLite db_path is no longer supported. "
+                "UsageStore now uses Neon PostgreSQL."
+            )
 
         self._initialize()
 
     # ======================================
-    # DATABASE CONNECTION
-    # ======================================
-
-    def _connect(self):
-
-        connection = sqlite3.connect(
-            self.db_path,
-            timeout=15,
-            isolation_level=None
-        )
-
-        connection.row_factory = sqlite3.Row
-
-        # Enable foreign-key enforcement
-        # for every database connection.
-        connection.execute(
-            "PRAGMA foreign_keys = ON"
-        )
-
-        # Wait for database locks.
-        connection.execute(
-            "PRAGMA busy_timeout = 15000"
-        )
-
-        return connection
-
-    # ======================================
-    # INITIALIZE DATABASE TABLES
+    # 6. VERIFY POSTGRESQL SCHEMA
     # ======================================
 
     def _initialize(self):
+        """
+        Verify existing PostgreSQL tables.
 
-        connection = self._connect()
+        Does not create, overwrite or delete
+        any existing application records.
+        """
 
-        try:
+        required_columns = {
 
-            connection.executescript("""
+            "guest_sessions": {
 
-                CREATE TABLE IF NOT EXISTS guest_sessions (
+                "token_hash",
 
-                    token_hash TEXT PRIMARY KEY,
+                "created_at",
 
-                    created_at INTEGER NOT NULL,
+                "expires_at"
+            },
 
-                    expires_at INTEGER NOT NULL
+            "usage_events": {
 
-                );
+                "id",
 
+                "principal_kind",
 
-                CREATE TABLE IF NOT EXISTS usage_events (
+                "principal_id",
 
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "occurred_at"
+            }
+        }
 
-                    principal_kind TEXT NOT NULL
+        with get_db_connection() as conn:
 
-                    CHECK (
-                        principal_kind IN ('guest', 'member')
-                    ),
+            rows = conn.execute("""
 
-                    principal_id TEXT NOT NULL,
+                SELECT
 
-                    occurred_at INTEGER NOT NULL
+                    table_name,
 
-                );
+                    column_name
 
+                FROM information_schema.columns
 
-                CREATE INDEX IF NOT EXISTS idx_usage_window
+                WHERE table_schema = 'public'
 
-                ON usage_events (
+                AND table_name IN (
+                    %s,
+                    %s
+                )
 
-                    principal_kind,
+            """, (
+                "guest_sessions",
+                "usage_events"
+            )).fetchall()
 
-                    principal_id,
+            actual_columns = {
 
-                    occurred_at
+                table: set()
 
-                );
+                for table in required_columns
+            }
 
-            """)
+            for row in rows:
 
-        finally:
+                table = _row_value(
+                    row,
+                    "table_name",
+                    0
+                )
 
-            connection.close()
+                column = _row_value(
+                    row,
+                    "column_name",
+                    1
+                )
+
+                if table in actual_columns:
+
+                    actual_columns[table].add(
+                        column
+                    )
+
+            for table, expected in required_columns.items():
+
+                missing = (
+                    expected - actual_columns[table]
+                )
+
+                if missing:
+
+                    raise RuntimeError(
+                        f"PostgreSQL schema incomplete: "
+                        f"{table} is missing "
+                        f"{', '.join(sorted(missing))}"
+                    )
+
+        print(
+            "PostgreSQL guest and usage tables verified."
+        )
 
     # ======================================
-    # HASH GUEST TOKEN
+    # 7. HASH GUEST TOKEN
     # ======================================
 
     @staticmethod
     def _digest(value: str) -> str:
+        """
+        Generate SHA-256 token hash.
+        """
 
         return hashlib.sha256(
             value.encode("utf-8")
         ).hexdigest()
 
     # ======================================
-    # CREATE GUEST SESSION
+    # 8. CURRENT TIMESTAMP
+    # ======================================
+
+    @staticmethod
+    def _timestamp(now=None) -> int:
+        """
+        Return Unix timestamp in seconds.
+        """
+
+        if now is None:
+
+            return int(time.time())
+
+        if isinstance(now, bool):
+
+            raise ValueError(
+                "Invalid timestamp."
+            )
+
+        try:
+
+            return int(now)
+
+        except (ValueError, TypeError, OverflowError) as exc:
+
+            raise ValueError(
+                "Invalid timestamp."
+            ) from exc
+
+    # ======================================
+    # 9. CALCULATE QUOTA WINDOW
+    # ======================================
+
+    @staticmethod
+    def _window_start(kind: str, instant: int) -> int:
+        """
+        Guest:
+            Rolling 24-hour window.
+
+        Member:
+            Bangladesh calendar-day window.
+        """
+
+        if kind == "guest":
+
+            return instant - DAY_SECONDS
+
+        if kind == "member":
+
+            return (
+
+                (
+                    (instant + DHAKA_OFFSET)
+                    // DAY_SECONDS
+                ) * DAY_SECONDS
+
+                - DHAKA_OFFSET
+
+            )
+
+        raise ValueError(
+            "Invalid account type."
+        )
+
+    # ======================================
+    # 10. VERIFY GUEST SESSION
+    # ======================================
+
+    @staticmethod
+    def _valid_guest(
+        conn,
+        guest_hash: str,
+        instant: int
+    ) -> bool:
+        """
+        Verify guest token hash and expiration.
+        """
+
+        row = conn.execute("""
+
+            SELECT 1
+
+            FROM guest_sessions
+
+            WHERE token_hash = %s
+
+            AND expires_at > %s
+
+            LIMIT 1
+
+        """, (
+            guest_hash,
+            instant
+        )).fetchone()
+
+        return row is not None
+
+    # ======================================
+    # 11. GET USAGE STATISTICS
+    # ======================================
+
+    @staticmethod
+    def _usage_statistics(
+        conn,
+        kind: str,
+        principal_id: str,
+        window_start: int
+    ):
+        """
+        Get message count and oldest event
+        inside the applicable quota window.
+        """
+
+        row = conn.execute("""
+
+            SELECT
+
+                COUNT(*) AS used,
+
+                MIN(occurred_at) AS oldest
+
+            FROM usage_events
+
+            WHERE principal_kind = %s
+
+            AND principal_id = %s
+
+            AND occurred_at > %s
+
+        """, (
+            kind,
+            principal_id,
+            window_start - 1
+        )).fetchone()
+
+        used = int(
+            _row_value(
+                row,
+                "used",
+                0
+            )
+        )
+
+        oldest = _row_value(
+            row,
+            "oldest",
+            1
+        )
+
+        return used, oldest
+
+    # ======================================
+    # 12. CREATE GUEST SESSION
     # ======================================
 
     def create_guest(self, *, now=None):
+        """
+        Create a new anonymous guest session.
 
-        instant = (
-            int(time.time())
-            if now is None
-            else now
-        )
+        Only the SHA-256 hash is stored.
+        """
+
+        instant = self._timestamp(now)
 
         token = secrets.token_urlsafe(32)
 
-        with closing(self._connect()) as conn:
+        token_hash = self._digest(token)
 
-            conn.execute(
-                """
+        with get_db_connection() as conn:
+
+            conn.execute("""
 
                 INSERT INTO guest_sessions (
 
@@ -197,24 +420,19 @@ class UsageStore:
 
                 )
 
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
 
-                """,
+            """, (
+                token_hash,
+                instant,
+                instant + DAY_SECONDS
+            ))
 
-                (
-                    self._digest(token),
-
-                    instant,
-
-                    instant + DAY_SECONDS
-
-                )
-            )
-
+        # Original token is returned only once.
         return token
 
     # ======================================
-    # VERIFY GUEST TOKEN
+    # 13. VERIFY GUEST TOKEN
     # ======================================
 
     def guest_principal(
@@ -223,47 +441,42 @@ class UsageStore:
         *,
         now=None
     ):
+        """
+        Verify a guest cookie.
 
-        if not token or len(token) > 256:
+        Returns:
+            SHA-256 guest identity hash
+            or None if invalid/expired.
+        """
+
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token) > 256
+        ):
+
             return None
 
-        instant = (
-            int(time.time())
-            if now is None
-            else now
-        )
+        instant = self._timestamp(now)
 
-        with closing(self._connect()) as conn:
+        guest_hash = self._digest(token)
 
-            row = conn.execute(
-                """
+        with get_db_connection() as conn:
 
-                SELECT token_hash
+            valid = self._valid_guest(
+                conn,
+                guest_hash,
+                instant
+            )
 
-                FROM guest_sessions
+        if not valid:
 
-                WHERE token_hash = ?
-
-                  AND expires_at > ?
-
-                """,
-
-                (
-                    self._digest(token),
-
-                    instant
-
-                )
-
-            ).fetchone()
-
-        if row is None:
             return None
 
-        return str(row["token_hash"])
+        return guest_hash
 
     # ======================================
-    # ATOMIC QUOTA ENFORCEMENT
+    # 14. ATOMIC QUOTA ENFORCEMENT
     # ======================================
 
     def check_and_consume(
@@ -273,115 +486,108 @@ class UsageStore:
         *,
         now=None
     ):
+        """
+        Atomically check and consume one message.
+
+        PostgreSQL transaction-level advisory locks
+        prevent concurrent requests from bypassing
+        quota restrictions for the same principal.
+
+        A denied request does not consume quota.
+        """
 
         if kind not in ("guest", "member"):
-            raise ValueError("Invalid account type")
+
+            raise ValueError(
+                "Invalid account type."
+            )
 
         if (
             not isinstance(principal_id, str)
             or not principal_id.strip()
         ):
-            raise ValueError("Principal ID required")
 
-        instant = (
-            int(time.time())
-            if now is None
-            else now
-        )
-
-        if kind == "guest":
-
-            limit = GUEST_LIMIT
-
-            start = instant - DAY_SECONDS
-
-        else:
-
-            limit = MEMBER_LIMIT
-
-            # Bangladesh calendar-day boundary
-            start = (
-                (
-                    (instant + DHAKA_OFFSET)
-                    // DAY_SECONDS
-                ) * DAY_SECONDS
-                - DHAKA_OFFSET
+            raise ValueError(
+                "Principal ID required."
             )
 
-        conn = self._connect()
+        principal_id = principal_id.strip()
 
-        try:
+        instant = self._timestamp(now)
 
-            # Prevent concurrent requests from
-            # bypassing the quota.
-            conn.execute("BEGIN IMMEDIATE")
+        limit = (
+            GUEST_LIMIT
+            if kind == "guest"
+            else MEMBER_LIMIT
+        )
+
+        start = self._window_start(
+            kind,
+            instant
+        )
+
+        lock_key = (
+            f"odhikar:quota:{kind}:{principal_id}"
+        )
+
+        with get_db_connection() as conn:
+
+            # ----------------------------------
+            # A. LOCK PRINCIPAL QUOTA
+            # ----------------------------------
+
+            conn.execute("""
+
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(%s, 0)
+                )
+
+            """, (
+                lock_key,
+            ))
+
+            # ----------------------------------
+            # B. VERIFY GUEST SESSION
+            # ----------------------------------
 
             if kind == "guest":
 
-                valid = conn.execute(
-                    """
-
-                    SELECT 1
-
-                    FROM guest_sessions
-
-                    WHERE token_hash = ?
-
-                      AND expires_at > ?
-
-                    """,
-
-                    (
-                        principal_id,
-
-                        instant
-
-                    )
-
-                ).fetchone()
-
-                if valid is None:
-
-                    raise ValueError(
-                        "Guest session expired or invalid"
-                    )
-
-            rows = conn.execute(
-                """
-
-                SELECT occurred_at
-
-                FROM usage_events
-
-                WHERE principal_kind = ?
-
-                  AND principal_id = ?
-
-                  AND occurred_at > ?
-
-                ORDER BY occurred_at ASC, id ASC
-
-                """,
-
-                (
-                    kind,
-
+                valid = self._valid_guest(
+                    conn,
                     principal_id,
-
-                    start - 1
-
+                    instant
                 )
 
-            ).fetchall()
+                if not valid:
 
-            used = len(rows)
+                    raise ValueError(
+                        "Guest session expired or invalid."
+                    )
+
+            # ----------------------------------
+            # C. GET EXISTING USAGE
+            # ----------------------------------
+
+            used, oldest = self._usage_statistics(
+                conn,
+                kind,
+                principal_id,
+                start
+            )
+
+            # ----------------------------------
+            # D. CHECK QUOTA
+            # ----------------------------------
 
             allowed = used < limit
 
+            # ----------------------------------
+            # E. CONSUME ONLY IF ALLOWED
+            # ----------------------------------
+
             if allowed:
 
-                conn.execute(
-                    """
+                conn.execute("""
 
                     INSERT INTO usage_events (
 
@@ -393,30 +599,27 @@ class UsageStore:
 
                     )
 
-                    VALUES (?, ?, ?)
+                    VALUES (%s, %s, %s)
 
-                    """,
-
-                    (
-                        kind,
-
-                        principal_id,
-
-                        instant
-
-                    )
-                )
+                """, (
+                    kind,
+                    principal_id,
+                    instant
+                ))
 
                 used += 1
+
+            # ----------------------------------
+            # F. CALCULATE RESET TIME
+            # ----------------------------------
 
             if kind == "guest":
 
                 reset_at = (
 
-                    int(rows[0]["occurred_at"])
-                    + DAY_SECONDS
+                    int(oldest) + DAY_SECONDS
 
-                    if rows
+                    if oldest is not None
 
                     else instant + DAY_SECONDS
 
@@ -426,7 +629,9 @@ class UsageStore:
 
                 reset_at = start + DAY_SECONDS
 
-            conn.execute("COMMIT")
+            # ----------------------------------
+            # G. RETURN QUOTA RESULT
+            # ----------------------------------
 
             return QuotaResult(
 
@@ -436,25 +641,17 @@ class UsageStore:
 
                 used=used,
 
-                remaining=max(0, limit - used),
+                remaining=max(
+                    0,
+                    limit - used
+                ),
 
                 reset_at=reset_at
 
             )
 
-        except Exception:
-
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-
-            raise
-
-        finally:
-
-            conn.close()
-
     # ======================================
-    # CHECK STATUS WITHOUT CHARGING
+    # 15. CHECK STATUS WITHOUT CHARGING
     # ======================================
 
     def status(
@@ -464,110 +661,77 @@ class UsageStore:
         *,
         now=None
     ):
+        """
+        Check current quota without consuming
+        a message.
+        """
 
         if kind not in ("guest", "member"):
-            raise ValueError("Invalid account type")
+
+            raise ValueError(
+                "Invalid account type."
+            )
 
         if (
             not isinstance(principal_id, str)
             or not principal_id.strip()
         ):
-            raise ValueError("Principal ID required")
 
-        instant = (
-            int(time.time())
-            if now is None
-            else now
-        )
-
-        if kind == "guest":
-
-            limit = GUEST_LIMIT
-
-            start = instant - DAY_SECONDS
-
-        else:
-
-            limit = MEMBER_LIMIT
-
-            start = (
-                (
-                    (instant + DHAKA_OFFSET)
-                    // DAY_SECONDS
-                ) * DAY_SECONDS
-                - DHAKA_OFFSET
+            raise ValueError(
+                "Principal ID required."
             )
 
-        with closing(self._connect()) as conn:
+        principal_id = principal_id.strip()
+
+        instant = self._timestamp(now)
+
+        limit = (
+            GUEST_LIMIT
+            if kind == "guest"
+            else MEMBER_LIMIT
+        )
+
+        start = self._window_start(
+            kind,
+            instant
+        )
+
+        with get_db_connection() as conn:
+
+            # Verify guest identity.
 
             if kind == "guest":
 
-                valid = conn.execute(
-                    """
-
-                    SELECT 1
-
-                    FROM guest_sessions
-
-                    WHERE token_hash = ?
-
-                      AND expires_at > ?
-
-                    """,
-
-                    (
-                        principal_id,
-
-                        instant
-
-                    )
-
-                ).fetchone()
-
-                if valid is None:
-
-                    raise ValueError(
-                        "Guest session expired or invalid"
-                    )
-
-            rows = conn.execute(
-                """
-
-                SELECT occurred_at
-
-                FROM usage_events
-
-                WHERE principal_kind = ?
-
-                  AND principal_id = ?
-
-                  AND occurred_at > ?
-
-                ORDER BY occurred_at ASC, id ASC
-
-                """,
-
-                (
-                    kind,
-
+                valid = self._valid_guest(
+                    conn,
                     principal_id,
-
-                    start - 1
-
+                    instant
                 )
 
-            ).fetchall()
+                if not valid:
 
-        used = len(rows)
+                    raise ValueError(
+                        "Guest session expired or invalid."
+                    )
+
+            # Read usage without consuming.
+
+            used, oldest = self._usage_statistics(
+                conn,
+                kind,
+                principal_id,
+                start
+            )
+
+        # Calculate reset time.
 
         if kind == "guest":
 
             reset_at = (
 
-                int(rows[0]["occurred_at"])
-                + DAY_SECONDS
+                int(oldest) + DAY_SECONDS
 
-                if rows
+                if oldest is not None
 
                 else instant + DAY_SECONDS
 
@@ -585,8 +749,124 @@ class UsageStore:
 
             used=used,
 
-            remaining=max(0, limit - used),
+            remaining=max(
+                0,
+                limit - used
+            ),
 
             reset_at=reset_at
 
         )
+
+
+# ==========================================
+# 16. USAGE STORE INFORMATION
+# ==========================================
+
+def get_usage_store_info() -> dict:
+
+    return {
+
+        "module": "Odhikar BD Usage Store",
+
+        "database": "Neon PostgreSQL",
+
+        "driver": "Psycopg 3",
+
+        "connection_pool": True,
+
+        "guest_limit": GUEST_LIMIT,
+
+        "guest_window": "Rolling 24 hours",
+
+        "member_limit": MEMBER_LIMIT,
+
+        "member_window": "Bangladesh calendar day",
+
+        "guest_token_hash": "SHA-256",
+
+        "atomic_quota_enforcement": True,
+
+        "concurrency_control": (
+            "PostgreSQL transaction-level advisory lock"
+        ),
+
+        "legacy_sqlite": False
+
+    }
+
+
+# ==========================================
+# 17. DIRECT EXECUTION
+# ==========================================
+
+if __name__ == "__main__":
+
+    from src.odhikar.database import (
+        close_db_pool,
+        get_db_connection
+    )
+
+    print("=" * 55)
+
+    print(
+        "ODHIKAR BD POSTGRESQL USAGE LIMITS"
+    )
+
+    print("=" * 55)
+
+    try:
+
+        store = UsageStore()
+
+        print(
+            "\nUSAGE STORE INFORMATION:"
+        )
+
+        print(
+            get_usage_store_info()
+        )
+
+        with get_db_connection() as conn:
+
+            guest_count = conn.execute("""
+
+                SELECT COUNT(*)
+
+                FROM guest_sessions
+
+            """).fetchone()
+
+            usage_count = conn.execute("""
+
+                SELECT COUNT(*)
+
+                FROM usage_events
+
+            """).fetchone()
+
+        print(
+            "\nEXISTING GUEST SESSIONS:",
+            _row_value(guest_count, "count", 0)
+        )
+
+        print(
+            "EXISTING USAGE EVENTS:",
+            _row_value(usage_count, "count", 0)
+        )
+
+        print(
+            "\nPOSTGRESQL USAGE SCHEMA: VERIFIED"
+        )
+
+        print(
+            "NO TEST QUOTA CONSUMED."
+        )
+
+        print(
+            "USAGE LIMITS TEST COMPLETED."
+        )
+
+    finally:
+
+        close_db_pool()

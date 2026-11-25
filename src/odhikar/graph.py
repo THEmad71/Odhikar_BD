@@ -1,9 +1,13 @@
 
-# ==========================================
-# ODHIKAR BD - LANGGRAPH + LANGSMITH
-# ==========================================
+# ============================================================
+# ODHIKAR BD - LANGGRAPH ENGINE
+# Neon PostgreSQL Persistent Checkpointing
+# ============================================================
 
-# 0. ORMSGPACK COMPATIBILITY
+
+# ============================================================
+# 0. MSGPACK COMPATIBILITY
+# ============================================================
 
 from src.odhikar.ormsgpack_compat import (
     install as install_ormsgpack_compat
@@ -12,81 +16,18 @@ from src.odhikar.ormsgpack_compat import (
 install_ormsgpack_compat()
 
 
-# ==========================================
-# 1. STANDARD IMPORTS
-# ==========================================
+# ============================================================
+# 1. IMPORTS
+# ============================================================
 
 import os
-import sqlite3
 import json
 import logging
-import hashlib
+import atexit
 
-from pathlib import Path
+from dotenv import load_dotenv
 
-
-# ==========================================
-# 2. CONFIGURATION
-# ==========================================
-
-from src.odhikar.config import settings
-
-
-# ==========================================
-# 3. LOGGING
-# ==========================================
-
-logger = logging.getLogger(__name__)
-
-
-# ==========================================
-# 4. LANGSMITH CONFIGURATION
-# ==========================================
-
-LANGSMITH_TRACING_ENABLED = bool(
-    settings.langsmith_tracing
-    and settings.langsmith_api_key
-)
-
-if settings.langsmith_api_key:
-
-    os.environ["LANGSMITH_API_KEY"] = (
-        settings.langsmith_api_key
-    )
-
-os.environ["LANGSMITH_TRACING"] = (
-    "true"
-    if LANGSMITH_TRACING_ENABLED
-    else "false"
-)
-
-os.environ["LANGSMITH_PROJECT"] = (
-    settings.langsmith_project
-)
-
-if settings.langsmith_tracing and not settings.langsmith_api_key:
-
-    logger.warning(
-        "LangSmith tracing requested but API key is missing."
-    )
-
-if LANGSMITH_TRACING_ENABLED:
-
-    logger.info(
-        "LangSmith tracing enabled. Project: %s",
-        settings.langsmith_project
-    )
-
-else:
-
-    logger.info(
-        "LangSmith tracing disabled."
-    )
-
-
-# ==========================================
-# 5. LANGCHAIN IMPORTS
-# ==========================================
+from psycopg_pool import ConnectionPool
 
 from langchain_core.messages import (
     HumanMessage,
@@ -101,14 +42,9 @@ from langgraph.graph import (
     MessagesState
 )
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
 
-
-# ==========================================
-# 6. ODHIKAR IMPORTS
-# ==========================================
-
-from src.odhikar.database import DB_PATH
+from src.odhikar.config import settings
 
 from src.odhikar.llm import (
     llm_with_tools
@@ -119,9 +55,74 @@ from src.odhikar.langchain_tools import (
 )
 
 
-# ==========================================
-# 7. SYSTEM PROMPT
-# ==========================================
+# ============================================================
+# 2. ENVIRONMENT CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = (
+    os.getenv("NEON_DATABASE_URL")
+    or os.getenv("DATABASE_URL")
+    or os.getenv("POSTGRES_URL")
+)
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "PostgreSQL connection URL is missing. "
+        "Set DATABASE_URL in your .env file."
+    )
+
+
+# ============================================================
+# 3. POSTGRESQL CONNECTION POOL
+# ============================================================
+
+connection_kwargs = {
+    "autocommit": True,
+    "prepare_threshold": 0
+}
+
+checkpoint_pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=10,
+    kwargs=connection_kwargs,
+    open=False
+)
+
+# Open and verify the connection pool.
+
+checkpoint_pool.open(wait=True)
+
+logger.info(
+    "Neon PostgreSQL connection pool initialized."
+)
+
+
+# ============================================================
+# 4. POSTGRESQL CHECKPOINTER
+# ============================================================
+
+checkpointer = PostgresSaver(
+    checkpoint_pool
+)
+
+# Create checkpoint tables if they do not exist.
+# Existing checkpoint data is preserved.
+
+checkpointer.setup()
+
+logger.info(
+    "PostgreSQL checkpoint tables initialized."
+)
+
+
+# ============================================================
+# 5. SYSTEM PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = SystemMessage(
     content="""
@@ -135,12 +136,16 @@ SYSTEM_PROMPT = SystemMessage(
     IMPORTANT CONVERSATION MEMORY RULES:
 
     1. Always consider previous conversation messages.
+
     2. Understand follow-up questions using previous context.
+
     3. If the user asks about imprisonment, fine, or punishment
        without naming an offence, identify the offence from
        the previous conversation.
+
     4. Do not ask the user to repeat information already
        available in conversation history.
+
     5. Use available tools when additional legal information
        needs to be retrieved.
 
@@ -155,9 +160,9 @@ SYSTEM_PROMPT = SystemMessage(
 )
 
 
-# ==========================================
-# 8. TOOL REGISTRY
-# ==========================================
+# ============================================================
+# 6. TOOL REGISTRY
+# ============================================================
 
 TOOL_MAP = {
     tool.name: tool
@@ -165,9 +170,9 @@ TOOL_MAP = {
 }
 
 
-# ==========================================
-# 9. CHATBOT NODE
-# ==========================================
+# ============================================================
+# 7. CHATBOT NODE
+# ============================================================
 
 def chatbot(state: MessagesState):
 
@@ -176,31 +181,8 @@ def chatbot(state: MessagesState):
         *state["messages"]
     ]
 
-    logger.info(
-        "Chatbot node started."
-    )
-
     response = llm_with_tools.invoke(
-        messages,
-        config={
-            "run_name": "odhikar_gemini_call",
-
-            "tags": [
-                "odhikar-bd",
-                "gemini",
-                "legal-assistant"
-            ],
-
-            "metadata": {
-                "application": "odhikar-bd",
-                "environment": settings.app_env,
-                "component": "chatbot"
-            }
-        }
-    )
-
-    logger.info(
-        "Chatbot node completed."
+        messages
     )
 
     return {
@@ -208,19 +190,16 @@ def chatbot(state: MessagesState):
     }
 
 
-# ==========================================
-# 10. CUSTOM TOOL EXECUTION NODE
-# ==========================================
+# ============================================================
+# 8. CUSTOM TOOL EXECUTION NODE
+# ============================================================
 
 def execute_tools(state: MessagesState):
 
     messages = state["messages"]
 
     if not messages:
-
-        return {
-            "messages": []
-        }
+        return {"messages": []}
 
     last_message = messages[-1]
 
@@ -231,14 +210,9 @@ def execute_tools(state: MessagesState):
     )
 
     if not tool_calls:
-
-        return {
-            "messages": []
-        }
+        return {"messages": []}
 
     tool_messages = []
-
-    # Execute every requested tool
 
     for call in tool_calls:
 
@@ -248,7 +222,7 @@ def execute_tools(state: MessagesState):
 
         tool_args = call.get("args", {})
 
-        # Validate tool call ID
+        # Validate tool call ID.
 
         if not tool_call_id:
 
@@ -259,16 +233,11 @@ def execute_tools(state: MessagesState):
 
             continue
 
-        # Find requested tool
+        # Find requested tool.
 
         tool = TOOL_MAP.get(tool_name)
 
         if tool is None:
-
-            logger.error(
-                "Unknown tool requested: %s",
-                tool_name
-            )
 
             result_content = json.dumps(
                 {
@@ -282,28 +251,21 @@ def execute_tools(state: MessagesState):
 
             try:
 
-                # Validate arguments
-
                 if not isinstance(tool_args, dict):
 
                     raise ValueError(
                         "Tool arguments must be a dictionary."
                     )
 
-                # Execute tool with tracing metadata
+                # Execute tool with tracing metadata.
 
                 tool_result = tool.invoke(
                     tool_args,
                     config={
-                        "run_name": (
-                            f"odhikar_tool_{tool_name}"
-                        ),
-
                         "tags": [
                             "odhikar-bd",
                             "legal-tool"
                         ],
-
                         "metadata": {
                             "application": "odhikar-bd",
                             "environment": settings.app_env,
@@ -312,7 +274,7 @@ def execute_tools(state: MessagesState):
                     }
                 )
 
-                # Convert result to readable JSON
+                # Convert result into readable JSON.
 
                 if isinstance(tool_result, str):
 
@@ -351,7 +313,7 @@ def execute_tools(state: MessagesState):
                     ensure_ascii=False
                 )
 
-        # Create ToolMessage
+        # Create ToolMessage.
 
         tool_message = ToolMessage(
             content=result_content,
@@ -368,16 +330,15 @@ def execute_tools(state: MessagesState):
     }
 
 
-# ==========================================
-# 11. CONDITIONAL ROUTER
-# ==========================================
+# ============================================================
+# 9. CONDITIONAL ROUTER
+# ============================================================
 
 def route_after_chatbot(state: MessagesState):
 
     messages = state["messages"]
 
     if not messages:
-
         return END
 
     last_message = messages[-1]
@@ -389,24 +350,23 @@ def route_after_chatbot(state: MessagesState):
     )
 
     if tool_calls:
-
         return "tools"
 
     return END
 
 
-# ==========================================
-# 12. CREATE GRAPH BUILDER
-# ==========================================
+# ============================================================
+# 10. CREATE GRAPH BUILDER
+# ============================================================
 
 graph_builder = StateGraph(
     MessagesState
 )
 
 
-# ==========================================
-# 13. REGISTER NODES
-# ==========================================
+# ============================================================
+# 11. REGISTER GRAPH NODES
+# ============================================================
 
 graph_builder.add_node(
     "chatbot",
@@ -419,9 +379,9 @@ graph_builder.add_node(
 )
 
 
-# ==========================================
-# 14. DEFINE GRAPH EDGES
-# ==========================================
+# ============================================================
+# 12. DEFINE GRAPH EDGES
+# ============================================================
 
 graph_builder.add_edge(
     START,
@@ -439,67 +399,26 @@ graph_builder.add_edge(
 )
 
 
-# ==========================================
-# 15. CENTRAL CHECKPOINT DATABASE
-# ==========================================
-
-CHECKPOINT_DB_PATH = Path(DB_PATH)
-
-CHECKPOINT_DB_PATH.parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-# ==========================================
-# 16. SQLITE CONNECTION
-# ==========================================
-
-checkpoint_connection = sqlite3.connect(
-    str(CHECKPOINT_DB_PATH),
-    check_same_thread=False,
-    timeout=30
-)
-
-checkpoint_connection.execute(
-    "PRAGMA foreign_keys = ON"
-)
-
-checkpoint_connection.execute(
-    "PRAGMA busy_timeout = 30000"
-)
-
-
-# ==========================================
-# 17. INITIALIZE CHECKPOINTER
-# ==========================================
-
-checkpointer = SqliteSaver(
-    checkpoint_connection
-)
-
-# Preserve existing checkpoint data.
-
-checkpointer.setup()
-
-
-# ==========================================
-# 18. COMPILE GRAPH
-# ==========================================
+# ============================================================
+# 13. COMPILE GRAPH WITH POSTGRESQL MEMORY
+# ============================================================
 
 odhikar_graph = graph_builder.compile(
     checkpointer=checkpointer
 )
 
+logger.info(
+    "Odhikar BD LangGraph compiled successfully."
+)
 
-# ==========================================
-# 19. EXTRACT READABLE TEXT
-# ==========================================
+
+# ============================================================
+# 14. EXTRACT READABLE TEXT
+# ============================================================
 
 def extract_text(content):
 
     if isinstance(content, str):
-
         return content
 
     if isinstance(content, list):
@@ -518,18 +437,16 @@ def extract_text(content):
 
             elif hasattr(block, "text"):
 
-                answer.append(
-                    block.text
-                )
+                answer.append(block.text)
 
         return "\n".join(answer).strip()
 
     return str(content)
 
 
-# ==========================================
-# 20. MAIN ODHIKAR GRAPH FUNCTION
-# ==========================================
+# ============================================================
+# 15. MAIN ODHIKAR GRAPH FUNCTION
+# ============================================================
 
 def ask_odhikar_graph(
     query: str,
@@ -544,109 +461,46 @@ def ask_odhikar_graph(
 
         return "A valid thread ID is required."
 
-    clean_thread_id = thread_id.strip()
-
-    # Create a non-reversible trace identifier.
-    # Do not expose the original session/thread ID
-    # as custom LangSmith metadata.
-
-    thread_hash = hashlib.sha256(
-        clean_thread_id.encode("utf-8")
-    ).hexdigest()[:20]
-
-    # LangGraph invocation configuration
-
     config = {
-
-        "run_name": "odhikar_bd_request",
-
-        "tags": [
-            "odhikar-bd",
-            "legal-assistant",
-            settings.app_env
-        ],
-
-        "metadata": {
-
-            "application": "odhikar-bd",
-
-            "environment": settings.app_env,
-
-            "thread_id": thread_hash,
-
-            "thread_id_hash": thread_hash
-        },
-
         "configurable": {
-
-            "thread_id": clean_thread_id
+            "thread_id": thread_id.strip()
         },
-
         "recursion_limit": 20
     }
 
-    logger.info(
-        "Starting Odhikar BD graph execution."
+    result = odhikar_graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=query.strip()
+                )
+            ]
+        },
+        config=config
     )
 
-    try:
+    messages = result.get(
+        "messages",
+        []
+    )
 
-        result = odhikar_graph.invoke(
-            {
-                "messages": [
-                    HumanMessage(
-                        content=query.strip()
-                    )
-                ]
-            },
-            config=config
-        )
+    if not messages:
+        return "No response was generated."
 
-        messages = result.get(
-            "messages",
-            []
-        )
+    final_message = messages[-1]
 
-        if not messages:
-
-            logger.warning(
-                "Graph returned no messages."
-            )
-
-            return (
-                "Sorry, I could not generate a response. "
-                "Please try again."
-            )
-
-        final_message = messages[-1]
-
-        answer = extract_text(
-            final_message.content
-        )
-
-        logger.info(
-            "Odhikar BD graph execution completed."
-        )
-
-        return answer
-
-    except Exception:
-
-        logger.exception(
-            "Odhikar BD graph execution failed."
-        )
-
-        raise
+    return extract_text(
+        final_message.content
+    )
 
 
-# ==========================================
-# 21. GRAPH INFORMATION
-# ==========================================
+# ============================================================
+# 16. GRAPH INFORMATION
+# ============================================================
 
 def get_graph_info():
 
     return {
-
         "graph_name": "Odhikar BD LangGraph",
 
         "nodes": [
@@ -658,27 +512,17 @@ def get_graph_info():
 
         "tool_execution": "custom",
 
-        "checkpoint_database": str(
-            CHECKPOINT_DB_PATH
-        ),
+        "checkpoint_database": "Neon PostgreSQL",
 
-        "memory_enabled": True,
+        "connection_pool": True,
 
-        "langsmith_tracing_enabled": (
-            LANGSMITH_TRACING_ENABLED
-        ),
-
-        "langsmith_project": (
-            settings.langsmith_project
-            if LANGSMITH_TRACING_ENABLED
-            else None
-        )
+        "memory_enabled": True
     }
 
 
-# ==========================================
-# 22. GET CONVERSATION HISTORY
-# ==========================================
+# ============================================================
+# 17. GET CONVERSATION HISTORY
+# ============================================================
 
 def get_conversation_history(thread_id: str):
 
@@ -687,9 +531,7 @@ def get_conversation_history(thread_id: str):
         return []
 
     config = {
-
         "configurable": {
-
             "thread_id": thread_id.strip()
         }
     }
@@ -699,10 +541,35 @@ def get_conversation_history(thread_id: str):
     )
 
     if not snapshot or not snapshot.values:
-
         return []
 
     return snapshot.values.get(
         "messages",
         []
     )
+
+
+# ============================================================
+# 18. CLOSE POSTGRESQL CONNECTION POOL
+# ============================================================
+
+def close_checkpoint_pool():
+
+    if checkpoint_pool.closed:
+        return
+
+    checkpoint_pool.close()
+
+    logger.info(
+        "Neon PostgreSQL checkpoint pool closed."
+    )
+
+
+atexit.register(
+    close_checkpoint_pool
+)
+
+
+# ============================================================
+# END OF ODHIKAR BD GRAPH ENGINE
+# ============================================================

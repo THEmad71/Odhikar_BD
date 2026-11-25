@@ -47,7 +47,12 @@ from pydantic import (
 )
 
 from src.odhikar.config import settings
-from src.odhikar.database import init_db
+from src.odhikar.database import (
+    open_db_pool,
+    verify_postgres_schema,
+    close_db_pool,
+)
+from src.odhikar.graph import close_checkpoint_pool
 
 from src.odhikar.auth_manager import register_user
 
@@ -549,20 +554,63 @@ app = FastAPI(
 
 
 # ==========================================
-# 12A. DATABASE INITIALIZATION
+# 12A. NEON POSTGRESQL INITIALIZATION
 # ==========================================
 
 @app.on_event("startup")
 def initialize_application_database():
     """
-    Ensure the central offences table exists before
-    the API starts serving requests.
+    Open the primary Neon PostgreSQL application pool
+    and verify the migrated application/checkpoint schema.
 
-    CREATE TABLE IF NOT EXISTS preserves existing data.
-    This does not populate or overwrite offence records.
+    The legacy SQLite init_db() function must not be called
+    by the production API.
     """
-    init_db()
-    logger.info("Odhikar BD central database initialized.")
+    try:
+        open_db_pool()
+        verify_postgres_schema()
+
+        logger.info(
+            "Odhikar BD Neon PostgreSQL database initialized "
+            "and schema verified."
+        )
+
+    except Exception:
+        logger.exception(
+            "Odhikar BD PostgreSQL initialization failed."
+        )
+
+        try:
+            close_db_pool()
+        except Exception:
+            logger.exception(
+                "Failed to close PostgreSQL application pool "
+                "after startup failure."
+            )
+
+        raise
+
+
+# ==========================================
+# 12B. DATABASE SHUTDOWN
+# ==========================================
+
+@app.on_event("shutdown")
+def shutdown_application_database():
+    """
+    Gracefully close both PostgreSQL connection pools.
+
+    The application pool stores user/auth/usage data.
+    The graph pool stores LangGraph checkpoints.
+    """
+    try:
+        close_db_pool()
+    finally:
+        close_checkpoint_pool()
+
+    logger.info(
+        "Odhikar BD PostgreSQL connection pools closed."
+    )
 
 
 
